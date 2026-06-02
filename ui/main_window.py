@@ -49,7 +49,7 @@ from torrent.buffering import BufferMonitor
 from torrent.file_selector import FileInfo
 from torrent.prioritizer import SeekPrioritizer
 from torrent.session import TorrentWorker
-from utils.config import AppConfig
+from utils.settings import SettingsManager
 from utils.external_player import launch_mpv, launch_vlc
 from utils.network import get_lan_ip
 from utils.cast import CastManager
@@ -110,14 +110,21 @@ class _AnimatedCastButton(QPushButton):
         br_g = int(77 + (160 - 77) * self._hover_val)
         br_b = int(140 + (255 - 140) * self._hover_val)
         
+        # Subtle glow
+        glow_r = min(255, r + int(20 * self._hover_val))
+        glow_g = min(255, g + int(20 * self._hover_val))
+        glow_b = min(255, b + int(20 * self._hover_val))
         self.setStyleSheet(f"""
             QPushButton {{
-                background: rgb({r}, {g}, {b});
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgb({glow_r}, {glow_g}, {glow_b}), stop:1 rgb({r}, {g}, {b}));
                 color: #fff;
                 font-weight: bold;
                 border-radius: 6px;
                 padding: 6px 16px;
                 border: 1px solid rgb({br_r}, {br_g}, {br_b});
+            }}
+            QPushButton:hover {{
+                border: 1px solid #77bbee;
             }}
             QPushButton:disabled {{
                 background: #2a2a2a;
@@ -225,7 +232,7 @@ class _FileSelectorDialog(QDialog):
 class MainWindow(QMainWindow):
     cast_devices_changed = Signal(list)
 
-    def __init__(self, config: AppConfig, cache: CacheManager) -> None:
+    def __init__(self, config: SettingsManager, cache: CacheManager) -> None:
         import time
         t0 = time.time()
         super().__init__()
@@ -305,6 +312,17 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Torrent LAN Streaming Server")
         self.resize(700, 650)
+        
+        # Load persistent UI settings
+        if getattr(self._config, "bitrate_limit", None):
+            self._throttle_combo.setCurrentText(self._config.bitrate_limit)
+
+        if getattr(self._config, "window_geometry", ""):
+            from PySide6.QtCore import QByteArray
+            self.restoreGeometry(QByteArray.fromBase64(self._config.window_geometry.encode("utf-8")))
+        if getattr(self._config, "window_state", ""):
+            from PySide6.QtCore import QByteArray
+            self.restoreState(QByteArray.fromBase64(self._config.window_state.encode("utf-8")))
         
         # Start device discovery
         t9 = time.time()
@@ -795,67 +813,16 @@ class MainWindow(QMainWindow):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(10)
 
-        self._save_path_label = QLineEdit()
-        self._save_path_label.setReadOnly(True)
-        self._save_path_label.setStyleSheet("color: #aaa; background: #222; border: 1px solid #444; border-radius: 4px; padding: 4px;")
-        
-        if self._config.save_path:
-            self._save_path_label.setText(f"Save To: {self._config.save_path}")
-        else:
-            self._save_path_label.setText("Save To: (Temporary Streaming Cache)")
-
-        self._change_save_btn = QPushButton("Change Folder…")
-        self._change_save_btn.setFixedHeight(28)
-        self._connect_button(self._change_save_btn, "Change Save Path", self._on_change_save_path)
-
-        self._reset_save_btn = QPushButton("Reset")
-        self._reset_save_btn.setFixedHeight(28)
-        self._reset_save_btn.setToolTip("Reset to Temporary Streaming Cache")
-        self._connect_button(self._reset_save_btn, "Reset Save Path", self._on_reset_save_path)
-
-        self._save_file_btn = QPushButton("Save Downloaded File…")
-        self._save_file_btn.setFixedHeight(28)
+        self._save_file_btn = QPushButton("💾 Save Downloaded File…")
+        self._save_file_btn.setFixedHeight(32)
         self._save_file_btn.setEnabled(False)
         self._save_file_btn.setToolTip("Copy the completed file to a permanent location")
         self._connect_button(self._save_file_btn, "Save Downloaded File", self._on_save_downloaded_file)
 
-        h.addWidget(self._save_path_label, stretch=1)
-        h.addWidget(self._change_save_btn)
-        h.addWidget(self._reset_save_btn)
+        h.addStretch(1)
         h.addWidget(self._save_file_btn)
         
         return panel
-
-    @Slot()
-    @_ui_debug_handler
-    def _on_reset_save_path(self) -> None:
-        self._config.save_path = ""
-        self._config.save()
-        self._save_path_label.setText("Save To: (Temporary Streaming Cache)")
-        self._debug_print("Save path reset to temporary cache")
-
-    @Slot()
-    @_ui_debug_handler
-    def _on_change_save_path(self) -> None:
-        from PySide6.QtWidgets import QFileDialog
-        import os
-        
-        current_dir = self._config.save_path or os.path.expanduser("~")
-        new_dir = QFileDialog.getExistingDirectory(
-            self, "Select Download Directory", current_dir,
-            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
-        )
-        
-        if new_dir:
-            self._config.save_path = new_dir
-            self._config.save()
-            self._save_path_label.setText(f"Save To: {new_dir}")
-            self._debug_print(f"Permanent save path set to: {new_dir}")
-        elif new_dir == "":
-            # If user clears or cancels, we might want to keep the old one, but 
-            # wait, if they want to clear it, they can't via QFileDialog easily.
-            # Let's add a clear button next time or right-click. For now, just cancel.
-            pass
 
     def _update_save_file_button(self) -> None:
         source_path = Path(self._current_file.abs_path) if self._current_file else None
@@ -883,7 +850,7 @@ class MainWindow(QMainWindow):
             self._set_status("⚠️  Downloaded file is not available on disk yet.")
             return
 
-        default_dir = self._config.save_path or str(Path.home())
+        default_dir = getattr(self._config, "last_save_dir", "") or str(Path.home())
         default_target = str(Path(default_dir) / self._current_file.name)
         target_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -898,6 +865,9 @@ class MainWindow(QMainWindow):
         if source.resolve() == target.resolve():
             self._set_status("ℹ️  The downloaded file is already at that location.")
             return
+            
+        self._config.last_save_dir = str(target.parent)
+        self._config.save()
 
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -979,6 +949,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     @_ui_debug_handler
     def _on_throttle_changed(self, text: str) -> None:
+        self._config.bitrate_limit = text
+        self._config.save()
         rate = 0
         if text == "20 Mbps": rate = 20 * 1024 * 1024 // 8
         elif text == "10 Mbps": rate = 10 * 1024 * 1024 // 8
@@ -1109,8 +1081,11 @@ class MainWindow(QMainWindow):
         log.info("[CAST UI] Combo count after update: %d", count)
         
         if count > 0:
-            # Auto-select the first discovered device
-            self._device_combo.setCurrentIndex(0)
+            preferred = getattr(self._config, "preferred_cast_device", "")
+            if preferred in devices:
+                self._device_combo.setCurrentText(preferred)
+            else:
+                self._device_combo.setCurrentIndex(0)
             selected = self._device_combo.currentText()
             log.info("[CAST UI] Auto-selected: %s", selected)
         else:
@@ -1142,12 +1117,15 @@ class MainWindow(QMainWindow):
             self._debug_print(f"[CAST] Selected device cleared: {device_name or '(empty)'}")
             self._sync_stream_debug_state()
             return
-
         self._selected_cast_device_name = device_name
         self._selected_cast_device = self._cast_devices[device_name]
         selected_ip = self._selected_cast_device_ip()
         self._debug_print(f"[CAST] Selected device IP: {selected_ip}")
         self._sync_stream_debug_state()
+        
+        if device_name:
+            self._config.preferred_cast_device = device_name
+            self._config.save()
 
     @Slot(bool, str)
     @_ui_debug_handler
@@ -1551,12 +1529,15 @@ class MainWindow(QMainWindow):
     @Slot()
     @_ui_debug_handler
     def _on_open_file(self) -> None:
+        last_dir = getattr(self._config, "last_open_dir", "")
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Torrent File", "", "Torrent Files (*.torrent)"
+            self, "Open Torrent File", last_dir, "Torrent Files (*.torrent)"
         )
         self._debug_print(f"[UI] Open file dialog returned path: {path}")
         if path:
             self._magnet_input.setText(path)
+            self._config.last_open_dir = str(Path(path).parent)
+            self._config.save()
 
     @Slot()
     @_ui_debug_handler
@@ -2122,19 +2103,57 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._debug_print("[APP] Closing application…")
-        self._cast_manager.stop_discovery()
+
+        # 1. Stop all timers first to prevent callbacks during teardown
+        self._buffer_timer.stop()
+        if hasattr(self, "_cast_poll_timer"):
+            self._cast_poll_timer.stop()
+
+        # 2. Stop the HTTP stream server
         if self._stream_server is not None:
-            self._stream_server.stop()
+            try:
+                self._stream_server.stop()
+            except Exception:
+                pass
             self._stream_server = None
             self._sync_stream_debug_state()
-        self._stream_source.detach()
-        self._buffer_timer.stop()
+
+        # 3. Detach stream source
+        try:
+            self._stream_source.detach()
+        except Exception:
+            pass
+
+        # 4. Stop cast manager (non-blocking — uses daemon threads internally)
+        try:
+            self._cast_manager.stop_cast()
+        except Exception:
+            pass
+        try:
+            self._cast_manager.stop_discovery()
+        except Exception:
+            pass
+
+        # 5. Stop the torrent worker's blocking loop BEFORE quitting the thread
         self._torrent_worker.stop()
         self._torrent_thread.quit()
-        self._torrent_thread.wait(3000)
-        self._config.save()
+        if not self._torrent_thread.wait(3000):  # 3 second timeout
+            log.warning("[APP] Torrent thread did not stop in time, terminating")
+            self._torrent_thread.terminate()
+            self._torrent_thread.wait(1000)
+
+        # 6. Save window state
+        try:
+            self._config.window_geometry = self.saveGeometry().toBase64().data().decode("utf-8")
+            self._config.window_state = self.saveState().toBase64().data().decode("utf-8")
+            self._config.save()
+        except Exception:
+            pass
+
+        # 7. Remove log handler
         if self._ui_log_handler is not None:
             logging.getLogger().removeHandler(self._ui_log_handler)
             self._ui_log_handler = None
+
         # CacheManager atexit hook handles actual deletion
         super().closeEvent(event)

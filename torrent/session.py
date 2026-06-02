@@ -31,7 +31,7 @@ except ImportError as exc:
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from torrent.file_selector import FileInfo, detect_video_files
-from utils.config import AppConfig
+from utils.settings import SettingsManager
 
 log = logging.getLogger("TORRENT")
 
@@ -62,7 +62,7 @@ class TorrentWorker(QObject):
     # Torrent has finished downloading completely
     torrent_finished = Signal()
 
-    def __init__(self, config: AppConfig, parent: Optional[QObject] = None) -> None:
+    def __init__(self, config: SettingsManager, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._config = config
         self._session: Optional[lt.session] = None
@@ -99,11 +99,12 @@ class TorrentWorker(QObject):
         self._cmd_queue.put(("add_torrent", path))
 
     def _get_save_path(self) -> str:
-        if self._config.save_path:
+        save_path = getattr(self._config, "save_path", "")
+        if save_path:
             # Ensure path exists
             from pathlib import Path
-            Path(self._config.save_path).mkdir(parents=True, exist_ok=True)
-            return self._config.save_path
+            Path(save_path).mkdir(parents=True, exist_ok=True)
+            return save_path
         return str(self._config.cache_dir)
 
     def _do_add_magnet(self, uri: str) -> None:
@@ -197,7 +198,7 @@ class TorrentWorker(QObject):
             file_prios[file_index],
             all(priority == 0 for idx, priority in enumerate(file_prios) if idx != file_index),
         )
-        log.info(
+        log.debug(
             "[SCHED] Startup window: target=%.1fMB pieces=%d-%d piece_size=%.1fMB",
             self._startup_target_bytes / (1024 * 1024),
             self._selected_first_piece,
@@ -213,7 +214,7 @@ class TorrentWorker(QObject):
     def _do_pause_download(self) -> None:
         if self._handle:
             self._handle.pause()
-            log.info("Torrent paused")
+            log.debug("Torrent paused")
 
     @Slot()
     def resume_download(self) -> None:
@@ -222,7 +223,7 @@ class TorrentWorker(QObject):
     def _do_resume_download(self) -> None:
         if self._handle:
             self._handle.resume()
-            log.info("Torrent resumed")
+            log.debug("Torrent resumed")
 
     @Slot()
     def remove_torrent(self) -> None:
@@ -232,7 +233,7 @@ class TorrentWorker(QObject):
         if self._session and self._handle:
             try:
                 self._session.remove_torrent(self._handle)
-                log.info("Torrent removed from session")
+                log.debug("Torrent removed from session")
             except Exception:
                 pass
         self._handle = None
@@ -252,20 +253,20 @@ class TorrentWorker(QObject):
         """Pause downloading (keeps peers connected)."""
         if self._handle is not None:
             self._handle.pause()
-            log.info("Torrent paused")
+            log.debug("Torrent paused")
 
     def resume_torrent(self) -> None:
         """Resume downloading after a pause."""
         if self._handle is not None:
             self._handle.resume()
-            log.info("Torrent resumed")
+            log.debug("Torrent resumed")
 
     def cancel(self) -> None:
         """Remove the current torrent from the session entirely."""
         if self._session and self._handle:
             try:
                 self._session.remove_torrent(self._handle)
-                log.info("Torrent removed from session")
+                log.debug("Torrent removed from session")
             except Exception:
                 pass
             self._handle = None
@@ -292,7 +293,7 @@ class TorrentWorker(QObject):
     def run(self) -> None:
         """Alert processing loop. Runs until stop() is called."""
         self._running = True
-        log.info("Torrent worker started")
+        log.debug("Torrent worker started")
 
         last_stat_emit = 0.0
 
@@ -327,7 +328,7 @@ class TorrentWorker(QObject):
                     
             time.sleep(0.1)  # 100 ms tick
 
-        log.info("Torrent worker stopped")
+        log.debug("Torrent worker stopped")
 
     def stop(self) -> None:
         """Signal the loop to exit. Call from any thread."""
