@@ -23,7 +23,7 @@ def _check_imports() -> bool:
     import importlib
     errors = []
     required = {
-        "PySide6": "pip install PySide6",
+        "PySide6": "pip install PySide6-Essentials",
         "libtorrent": "pip install libtorrent  (or python-libtorrent)",
         "qrcode": "pip install qrcode",
         "PIL": "pip install Pillow",

@@ -108,28 +108,74 @@ class _LoopbackThreadingServer(ThreadingHTTPServer):
     # Throttling limit (bytes per second, 0 = unlimited)
     throttle_rate: int = 0
 
+    # Total connections/reconnect counts
+    reconnect_count: int = 0
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc_type, exc_value, _ = sys.exc_info()
+        if exc_type and issubclass(exc_type, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            log.info("[HTTP] Client disconnected during stream read client=%s", client_address[0])
+            return
+        try:
+            super().handle_error(request, client_address)
+        except Exception:
+            pass
+
 class _StreamHandler(BaseHTTPRequestHandler):
     # Quiet default access log — we'll log via our own logger
     def log_message(self, fmt: str, *args) -> None:  # type: ignore[override]
         log.debug("HTTP %s - " + fmt, self.address_string(), *args)
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as exc:
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            log.info("[HTTP] Client disconnected during stream read client=%s (%s)", client_ip, str(exc))
+        except OSError as exc:
+            client_ip = self.client_address[0] if self.client_address else "unknown"
+            if getattr(exc, "winerror", None) == 10054 or exc.errno == 10054 or "10054" in str(exc):
+                log.info("[HTTP] Client disconnected during stream read client=%s (WinError 10054)", client_ip)
+            else:
+                log.debug("[HTTP] OSError in request handler client=%s: %s", client_ip, exc)
+        except Exception as exc:
+            log.debug("[HTTP] General exception in request handler: %s", exc)
 
     # ------------------------------------------------------------------ #
     #  Request dispatch                                                    #
     # ------------------------------------------------------------------ #
 
     def do_HEAD(self) -> None:
-        self._serve(head_only=True)
+        try:
+            self._serve(head_only=True)
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+                if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
+                    raise
+            log.info("[HTTP] Client disconnected during stream read")
 
     def do_GET(self) -> None:
         server: _LoopbackThreadingServer = self.server  # type: ignore[assignment]
         if self.path == "/" or self.path == "":
-            self._serve_landing_page()
+            try:
+                self._serve_landing_page()
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as exc:
+                if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+                    if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
+                        raise
+                log.info("[HTTP] Client disconnected during stream read")
             return
 
         with server.viewers_lock:
             server.active_viewers += 1
         try:
             self._serve(head_only=False)
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+                if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
+                    raise
+            log.info("[HTTP] Client disconnected during stream read")
         finally:
             with server.viewers_lock:
                 server.active_viewers = max(0, server.active_viewers - 1)
@@ -226,6 +272,18 @@ class _StreamHandler(BaseHTTPRequestHandler):
             start, end = parsed
             status = HTTPStatus.PARTIAL_CONTENT
 
+        # Increment request count
+        with server.state_lock:
+            server.reconnect_count += 1
+            reconnect_count = server.reconnect_count
+
+        client_ip = self.client_address[0]
+        # Log request diagnostics
+        if range_header:
+            log.info("[HTTP] Range request start=%d end=%d client=%s reconnect_count=%d", start, end, client_ip, reconnect_count)
+        else:
+            log.info("[HTTP] Request whole file client=%s reconnect_count=%d", client_ip, reconnect_count)
+
         # ── Seek detection ───────────────────────────────────────────
         with server.state_lock:
             prev_end = server.last_end_byte
@@ -254,7 +312,11 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+            if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+                if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
+                    raise
+            log.info("[HTTP] Client disconnected during stream read")
             return
 
         if head_only:
@@ -270,9 +332,11 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     continue
                 try:
                     self.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    log.debug("Client closed connection mid-stream "
-                              "(sent=%d/%d)", sent, content_length)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError) as exc:
+                    if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+                        if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
+                            raise
+                    log.info("[HTTP] Client disconnected during stream read (sent=%d/%d client=%s)", sent, content_length, client_ip)
                     return
                 sent += len(chunk)
                 with server.state_lock:
@@ -285,6 +349,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     if elapsed < expected_time:
                         time.sleep(expected_time - elapsed)
 
+            log.info("[HTTP] Serve completed: start=%d end=%d client=%s sent=%d bytes_served=%d", start, end, client_ip, sent, sent)
         except Exception as exc:  # noqa: BLE001 — never crash request thread
             log.warning("read_range failed: %s", exc)
 

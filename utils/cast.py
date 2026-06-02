@@ -2,6 +2,8 @@
 Utilities for discovering and controlling Chromecast-compatible receivers.
 """
 import logging
+import subprocess
+import json
 import ssl
 import threading
 import time
@@ -58,6 +60,52 @@ class _CastSession:
     title: str
 
 
+def get_media_duration(url: str, file_path: str = "", file_size: int = 0) -> float:
+    import os
+    # Try probing file_path first if it exists
+    targets = []
+    if file_path and os.path.exists(file_path):
+        targets.append(file_path)
+    if url:
+        targets.append(url)
+        
+    for target in targets:
+        try:
+            cmd = [
+                "ffprobe", 
+                "-v", "error", 
+                "-show_entries", "format=duration", 
+                "-of", "json", 
+                target
+            ]
+            creationflags = 0
+            if os.name == 'nt':
+                creationflags = 0x08000000  # CREATE_NO_WINDOW
+            result = subprocess.run(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE, 
+                text=True, 
+                timeout=3.0, 
+                creationflags=creationflags
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                duration_str = data.get("format", {}).get("duration")
+                if duration_str:
+                    d = float(duration_str)
+                    if d > 0:
+                        return d
+        except Exception:
+            pass
+        
+    if file_size > 0:
+        # Estimate duration assuming average bitrate of ~2.5 Mbps (312,500 bytes per second)
+        return file_size / 312500.0
+        
+    return 0.0
+
+
 class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListener):
     def __init__(self) -> None:
         self._devices: dict[str, pychromecast.Chromecast] = {}
@@ -83,7 +131,36 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
         self.active_cast = None
         self.active_media_controller = None
         
+        # Centralized Cast Session Model
+        self.cast_session = {
+            "device_name": None,
+            "connected": False,
+            "media_session_id": None,
+            "content_id": None,
+            "playback_state": "DISCONNECTED",
+            "last_time": 0.0,
+            "duration": 0.0,
+            "last_update": 0.0,
+            "stream_url": None,
+            "started_at": 0.0
+        }
+        self.reconnect_count = 0
+        self._had_previous_connection = False
+        self._stream_active = False
+        self._stream_reconnect_count = 0
+        self._last_reconnect_count = 0
+        
         log.info("CastManager initialized")
+
+    @property
+    def inferred_playback_state(self) -> str:
+        with self._session_lock:
+            return self.cast_session["playback_state"]
+
+    def update_stream_activity(self, is_active: bool, reconnect_count: int) -> None:
+        with self._session_lock:
+            self._stream_active = is_active
+            self._stream_reconnect_count = reconnect_count
 
     def start_discovery(self, on_devices_changed: Callable[[list[str]], None]) -> None:
         self._on_devices_changed = on_devices_changed
@@ -219,111 +296,227 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
                 return False
             return True
 
+    def _get_device_name(self, cc) -> str:
+        if cc is None:
+            return "(none)"
+        name = getattr(cc, "name", None)
+        if name:
+            return name
+        cast_info = getattr(cc, "cast_info", None)
+        if cast_info:
+            friendly_name = getattr(cast_info, "friendly_name", None)
+            if friendly_name:
+                return friendly_name
+        device = getattr(cc, "device", None)
+        if device:
+            friendly_name = getattr(device, "friendly_name", None)
+            if friendly_name:
+                return friendly_name
+        return "(unknown)"
+
     def new_media_status(self, status: MediaStatus) -> None:
-        player_state = getattr(status, "player_state", None)
-        media_session_id = getattr(status, "media_session_id", None)
-        current_time = getattr(status, "current_time", 0.0) or 0.0
-        duration = getattr(status, "duration", 0.0) or 0.0
+        try:
+            player_state = getattr(status, "player_state", None) or "UNKNOWN"
+            media_session_id = getattr(status, "media_session_id", None)
+            current_time = getattr(status, "current_time", 0.0) or 0.0
+            duration = getattr(status, "duration", 0.0) or 0.0
+            playback_rate = getattr(status, "playback_rate", 1.0)
+            if playback_rate is None:
+                playback_rate = 1.0
+            content_id = getattr(status, "content_id", None)
 
-        with self._session_lock:
-            self._last_known_time = current_time
-            should_log = (
-                player_state != self._last_player_state
-                or media_session_id != self._last_media_session_id
-            )
-            self._last_player_state = player_state
-            self._last_media_session_id = media_session_id
-            session = self._session
-            
-            # Update persistent playing state based on actual events
-            self.cast_playing = (player_state == "PLAYING")
-            
-            if self._current_cast:
-                self.cast_connected = self._current_cast.socket_client.is_connected
-                if self.cast_connected:
-                    self.active_cast = self._current_cast
-                    self.active_media_controller = self._current_cast.media_controller
-                    self.cast_device_name = self._current_cast.device.friendly_name
+            now = time.monotonic()
 
-        if should_log:
-            device_name = session.device_name if session else "(unknown)"
+            with self._session_lock:
+                self._last_known_time = current_time
+                self._last_player_state = player_state
+                self._last_media_session_id = media_session_id
+                session = self._session
+
+                # Real playback-state inference
+                prev_time = self.cast_session.get("last_time") or 0.0
+                prev_update = self.cast_session.get("last_update") or 0.0
+                prev_state = self.cast_session.get("playback_state") or "DISCONNECTED"
+
+                # Check if current_time has progressed since the last update
+                time_progressed = False
+                if prev_update > 0 and (now - prev_update) > 0.2:
+                    time_progressed = (current_time > prev_time + 0.01)
+
+                # Set base connection details
+                self.cast_connected = False
+                if self._current_cast:
+                    socket_client = getattr(self._current_cast, "socket_client", None)
+                    self.cast_connected = getattr(socket_client, "is_connected", False) if socket_client else False
+                    if self.cast_connected:
+                        self.active_cast = self._current_cast
+                        self.active_media_controller = getattr(self._current_cast, "media_controller", None)
+                        self.cast_device_name = self._get_device_name(self._current_cast)
+
+                # Get stream reconnects
+                prev_reconnect = getattr(self, "_last_reconnect_count", 0)
+                reconnect_count = getattr(self, "_stream_reconnect_count", 0)
+                reconnects_occurred = (reconnect_count > prev_reconnect)
+                self._last_reconnect_count = reconnect_count
+
+                inferred = "UNKNOWN"
+                if not self.cast_connected:
+                    inferred = "DISCONNECTED"
+                elif not media_session_id:
+                    inferred = "IDLE"
+                elif player_state == "BUFFERING":
+                    inferred = "BUFFERING"
+                elif player_state == "PLAYING":
+                    # Stalled timer during active playback -> buffering
+                    if not time_progressed and (now - prev_update) > 2.0:
+                        inferred = "BUFFERING"
+                    else:
+                        inferred = "PLAYING"
+                elif player_state == "PAUSED":
+                    inferred = "PAUSED"
+                else:
+                    # Resolve UNKNOWN states defensively using inference rules
+                    # CASE A: If media_session_id exists, current_time increases, playback_rate > 0 -> PLAYING
+                    if time_progressed and playback_rate > 0:
+                        inferred = "PLAYING"
+                    # CASE B: If media session exists, current_time stagnant, playback_rate == 0 -> PAUSED
+                    elif not time_progressed and playback_rate == 0:
+                        inferred = "PAUSED"
+                    # CASE C: If media session active, repeated reconnects/range requests, timer temporarily stalled -> BUFFERING
+                    elif not time_progressed and (reconnects_occurred or getattr(self, "_stream_active", False)):
+                        inferred = "BUFFERING"
+                    else:
+                        inferred = "PLAYING"  # Fallback assumption if connected with session
+
+                # Transition PLAYING -> BUFFERING if time is stalled for >2 seconds during playback
+                if inferred == "PLAYING" and not time_progressed and prev_state == "PLAYING" and prev_update > 0 and (now - prev_update) > 2.0:
+                    inferred = "BUFFERING"
+
+                # Update the cast session model
+                self.cast_session["connected"] = self.cast_connected
+                self.cast_session["device_name"] = self.cast_device_name
+                self.cast_session["media_session_id"] = media_session_id
+                if content_id:
+                    self.cast_session["content_id"] = content_id
+                self.cast_session["last_time"] = current_time
+                if duration > 0:
+                    self.cast_session["duration"] = duration
+                self.cast_session["last_update"] = now
+                self.cast_session["playback_state"] = inferred
+
+                self.cast_playing = (inferred == "PLAYING")
+
+            # 6. Add logging once: [CAST] Media status updated: player_state, current_time, duration, device_name
+            device_name = self.cast_device_name or (session.device_name if session else "(unknown)")
             log.info(
-                "[CAST] Player state device=%s state=%s session=%s time=%.1f/%.1f",
-                device_name,
-                player_state,
-                media_session_id,
+                "[CAST] Media status updated: state=%s time=%.1f duration=%.1f device=%s",
+                inferred,
                 current_time,
-                duration,
+                self.cast_session["duration"],
+                device_name,
             )
 
-        if self._on_media_status:
-            self._on_media_status(status)
+            if self._on_media_status:
+                try:
+                    self._on_media_status(status)
+                except Exception as cb_exc:
+                    log.exception("[CAST] Exception in UI media status callback: %s", cb_exc)
+        except Exception as exc:
+            log.exception("[CAST] Exception in new_media_status: %s", exc)
 
     def new_cast_status(self, status: CastStatus) -> None:
-        signature = (status.app_id, status.display_name, status.transport_id)
-        with self._session_lock:
-            should_log = signature != self._last_receiver_signature
-            self._last_receiver_signature = signature
-            session = self._session
+        try:
+            signature = (status.app_id, status.display_name, status.transport_id)
+            with self._session_lock:
+                should_log = signature != self._last_receiver_signature
+                self._last_receiver_signature = signature
+                session = self._session
 
-        if not should_log:
-            return
+            if not should_log:
+                return
 
-        device_name = session.device_name if session else "(unknown)"
-        log.info(
-            "[CAST] Receiver status device=%s app_id=%s app=%s transport_id=%s",
-            device_name,
-            status.app_id,
-            status.display_name,
-            status.transport_id,
-        )
+            device_name = session.device_name if session else "(unknown)"
+            log.info(
+                "[CAST] Receiver status device=%s app_id=%s app=%s transport_id=%s",
+                device_name,
+                status.app_id,
+                status.display_name,
+                status.transport_id,
+            )
+        except Exception as exc:
+            log.exception("[CAST] Exception in new_cast_status: %s", exc)
 
     def new_connection_status(self, status: ConnectionStatus) -> None:
-        address = status.address.address if status.address else None
-        port = status.address.port if status.address else None
-        log.info(
-            "[CAST] Connection status=%s address=%s port=%s service=%s",
-            status.status,
-            address,
-            port,
-            status.service,
-        )
+        try:
+            address = status.address.address if status.address else None
+            port = status.address.port if status.address else None
+            log.info(
+                "[CAST] Connection status=%s address=%s port=%s service=%s",
+                status.status,
+                address,
+                port,
+                status.service,
+            )
 
-        if status.status in (
-            CONNECTION_STATUS_DISCONNECTED,
-            CONNECTION_STATUS_FAILED,
-            CONNECTION_STATUS_LOST,
-        ):
-            was_active = False
-            with self._session_lock:
-                if self.active_cast or self._current_cast or self._session:
-                    was_active = True
-                self.cast_connected = False
-                self.cast_playing = False
-                self.cast_device_name = None
-                self.active_cast = None
-                self.active_media_controller = None
-                self._current_cast = None
-                self._session = None
-                self._last_known_time = 0.0
-                self._last_player_state = None
-                self._last_media_session_id = None
-                self._last_receiver_signature = None
+            if status.status in (
+                CONNECTION_STATUS_DISCONNECTED,
+                CONNECTION_STATUS_FAILED,
+                CONNECTION_STATUS_LOST,
+            ):
+                was_active = False
+                with self._session_lock:
+                    if self.active_cast or self._current_cast or self._session:
+                        was_active = True
+                    self.cast_connected = False
+                    self.cast_playing = False
+                    self.cast_device_name = None
+                    self.active_cast = None
+                    self.active_media_controller = None
+                    self._current_cast = None
+                    self._session = None
+                    self._last_known_time = 0.0
+                    self._last_player_state = None
+                    self._last_media_session_id = None
+                    self._last_receiver_signature = None
 
-            self._stop_status_poller()
-            if was_active and self._on_connection_changed:
-                self._on_connection_changed(False, status.status)
+                    # Update centralized session model
+                    self.cast_session["connected"] = False
+                    self.cast_session["playback_state"] = "DISCONNECTED"
 
-        if status.status == CONNECTION_STATUS_CONNECTED:
-            with self._session_lock:
-                self.cast_connected = True
-                if self._current_cast:
-                    self.active_cast = self._current_cast
-                    self.active_media_controller = self._current_cast.media_controller
-                    self.cast_device_name = self._current_cast.device.friendly_name
-            self._refresh_status_async()
-            if self._on_connection_changed:
-                self._on_connection_changed(True, "CONNECTED")
+                self._stop_status_poller()
+                if was_active and self._on_connection_changed:
+                    try:
+                        self._on_connection_changed(False, status.status)
+                    except Exception as cb_exc:
+                        log.exception("[CAST] Exception in UI connection callback: %s", cb_exc)
+
+            if status.status == CONNECTION_STATUS_CONNECTED:
+                with self._session_lock:
+                    self.cast_connected = True
+                    if self._current_cast:
+                        self.active_cast = self._current_cast
+                        self.active_media_controller = getattr(self._current_cast, "media_controller", None)
+                        self.cast_device_name = self._get_device_name(self._current_cast)
+                    
+                    # Update reconnect metrics
+                    if getattr(self, "_had_previous_connection", False):
+                        self.reconnect_count += 1
+                    self._had_previous_connection = True
+
+                    # Update centralized session model
+                    self.cast_session["connected"] = True
+                    self.cast_session["device_name"] = self.cast_device_name
+                    if self.cast_session["playback_state"] == "DISCONNECTED":
+                        self.cast_session["playback_state"] = "CONNECTED"
+
+                self._refresh_status_async()
+                if self._on_connection_changed:
+                    try:
+                        self._on_connection_changed(True, "CONNECTED")
+                    except Exception as cb_exc:
+                        log.exception("[CAST] Exception in UI connection callback: %s", cb_exc)
+        except Exception as exc:
+            log.exception("[CAST] Exception in new_connection_status: %s", exc)
 
     def load_media_failed(self, queue_item_id: int, error_code: int) -> None:
         log.error(
@@ -338,18 +531,25 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
         url: str,
         content_type: str = "video/mp4",
         title: str = "TorrentStream",
+        file_path: str = "",
+        file_size: int = 0,
         on_finished: Optional[Callable[[bool], None]] = None,
     ) -> None:
         log.info(
-            "[CAST] Cast request device=%s url=%s content_type=%s",
+            "[CAST] Cast request device=%s url=%s content_type=%s file_path=%s file_size=%d",
             device_name,
             url,
             content_type,
+            file_path,
+            file_size,
         )
 
         def worker() -> None:
             success = False
             try:
+                # Estimate/probe duration in the background worker thread
+                duration = get_media_duration(url, file_path, file_size)
+
                 cc = self._ensure_device(device_name)
                 self._register_listeners(cc)
                 try:
@@ -375,6 +575,17 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
                         content_type=content_type,
                         title=title or "TorrentStream",
                     )
+                    
+                    # Update cast session model
+                    self.cast_session["device_name"] = device_name
+                    self.cast_session["connected"] = True
+                    self.cast_session["stream_url"] = url
+                    self.cast_session["duration"] = duration
+                    self.cast_session["media_session_id"] = getattr(cc.media_controller.status, "media_session_id", None)
+                    self.cast_session["content_id"] = getattr(cc.media_controller.status, "content_id", url)
+                    self.cast_session["started_at"] = time.monotonic()
+                    self.cast_session["playback_state"] = "PLAYING"
+
                 self._start_status_poller()
                 success = True
             except Exception as exc:
@@ -433,6 +644,20 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
             self.cast_device_name = None
             self.active_cast = None
             self.active_media_controller = None
+            
+            # Reset centralized session model
+            self.cast_session = {
+                "device_name": None,
+                "connected": False,
+                "media_session_id": None,
+                "content_id": None,
+                "playback_state": "DISCONNECTED",
+                "last_time": 0.0,
+                "duration": 0.0,
+                "last_update": 0.0,
+                "stream_url": None,
+                "started_at": 0.0
+            }
             
             self._current_cast = None
             self._session = None

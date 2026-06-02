@@ -213,6 +213,17 @@ class MainWindow(QMainWindow):
         self._cast_manager = CastManager()
         self.cast_devices_changed.connect(self._update_cast_devices)
 
+        self._cast_is_playing = False
+        self._cast_duration = 0.0
+        self._cast_connect_pending = False
+        self._expected_disconnect = False
+        self.active_stream_url = None
+
+        # Dedicated playback-state polling timer
+        self._cast_poll_timer = QTimer(self)
+        self._cast_poll_timer.setInterval(1000)
+        self._cast_poll_timer.timeout.connect(self._poll_cast_playback)
+
         self._build_ui()
         self._attach_debug_log_handler()
         self._flush_debug_backlog()
@@ -228,10 +239,6 @@ class MainWindow(QMainWindow):
         self._cast_manager.set_status_listener(self._on_cast_media_status)
         self._cast_manager.set_connection_listener(self._on_cast_connection_changed)
 
-        self._cast_is_playing = False
-        self._cast_duration = 0.0
-        self._cast_connect_pending = False
-        self._expected_disconnect = False
         log.info("LAN IP: %s", self._lan_ip)
         log.info("HTTP bind address: %s", self._stream_bind_address())
         self._sync_stream_debug_state()
@@ -335,7 +342,8 @@ class MainWindow(QMainWindow):
 
     def _sync_stream_debug_state(self) -> None:
         ready = self._stream_url_ready()
-        can_cast = ready and self._has_selected_cast_device()
+        cast_connected = self._cast_manager.cast_session.get("connected", False)
+        can_cast = ready and self._has_selected_cast_device() and not cast_connected and not self._cast_connect_pending
         for button in (
             self._copy_loc_btn,
             self._copy_lan_btn,
@@ -345,8 +353,11 @@ class MainWindow(QMainWindow):
             button.setEnabled(ready)
         self._cast_btn.setEnabled(can_cast)
 
-        if not ready:
-            self._stop_cast_btn.setEnabled(False)
+        if not ready or not cast_connected:
+            if not self._cast_connect_pending:
+                self._stop_cast_btn.setEnabled(False)
+        else:
+            self._stop_cast_btn.setEnabled(True)
 
         server_state = "RUNNING" if self._stream_server is not None else "STOPPED"
         port = self._stream_server.port if self._stream_server is not None else 0
@@ -911,7 +922,6 @@ class MainWindow(QMainWindow):
         self._selected_cast_device_name = device_name
         self._selected_cast_device = self._cast_devices[device_name]
         selected_ip = self._selected_cast_device_ip()
-        self._debug_print(f"[CAST] Selected device: {device_name}")
         self._debug_print(f"[CAST] Selected device IP: {selected_ip}")
         self._sync_stream_debug_state()
 
@@ -919,13 +929,17 @@ class MainWindow(QMainWindow):
     @_ui_debug_handler
     def _on_cast_connection_changed(self, connected: bool, reason: str) -> None:
         self._debug_print(f"[CAST UI] Connection status changed: connected={connected} reason={reason}")
-        if not connected:
+        if connected:
+            if not self._cast_poll_timer.isActive():
+                self._cast_poll_timer.start()
+        else:
             if getattr(self, "_expected_disconnect", False):
                 self._expected_disconnect = False
             else:
                 QTimer.singleShot(0, lambda: self._handle_cast_disconnect(unexpected=True))
 
     def _handle_cast_disconnect(self, unexpected: bool = False) -> None:
+        self._cast_poll_timer.stop()
         self._cast_is_playing = False
         self._cast_connect_pending = False
         self._cast_duration = 0.0
@@ -949,27 +963,175 @@ class MainWindow(QMainWindow):
         
         self._sync_stream_debug_state()
 
+    @Slot()
+    @_ui_debug_handler
+    def _poll_cast_playback(self) -> None:
+        import time
+        # Get HTTP server info to update CastManager stream activity knowledge
+        if self._stream_server:
+            active_viewers = self._stream_server.active_viewers
+            reconnect_count = self._stream_server._server.reconnect_count if self._stream_server._server else 0
+            self._cast_manager.update_stream_activity(active_viewers > 0, reconnect_count)
+        else:
+            self._cast_manager.update_stream_activity(False, 0)
+
+        # Read cast session model under lock
+        with self._cast_manager._session_lock:
+            session = dict(self._cast_manager.cast_session)
+            
+        connected = session.get("connected", False)
+        playback_state = session.get("playback_state", "DISCONNECTED")
+        device_name = session.get("device_name") or self._selected_cast_device_name or "Chromecast"
+        current_time = session.get("last_time", 0.0) or 0.0
+        duration = session.get("duration", 0.0) or 0.0
+        media_session_id = session.get("media_session_id")
+        has_session = media_session_id is not None
+        
+        # Extrapolate current time if actively playing
+        if playback_state == "PLAYING":
+            last_update = session.get("last_update", 0.0)
+            if last_update > 0:
+                delta = time.monotonic() - last_update
+                if duration > 0:
+                    current_time = min(duration, current_time + delta)
+                else:
+                    current_time = current_time + delta
+
+        # Automatic disconnect recovery
+        if not connected or playback_state == "DISCONNECTED":
+            if self._cast_connect_pending or self._cast_controls_widget.isVisible() or self._cast_diag_group.isVisible():
+                self._debug_print("[CAST UI] Loss of connection detected, triggering recovery")
+                self._handle_cast_disconnect(unexpected=True)
+                return
+
+        # Map inferred playback states to required status messages
+        # Required statuses:
+        # Connecting…
+        # Connected
+        # Launching Media…
+        # Buffering…
+        # Playing
+        # Paused
+        # Disconnected
+        # Reconnecting…
+        
+        status_text = "Disconnected"
+        color = "#e84040"
+        
+        if not connected:
+            status_text = "Disconnected"
+            color = "#e84040"
+        elif self._cast_connect_pending:
+            if playback_state == "PLAYING":
+                self._cast_connect_pending = False
+                status_text = "Playing"
+                color = "#4caf50"
+            elif playback_state == "BUFFERING":
+                status_text = "Buffering…"
+                color = "#ffb74d"
+            elif playback_state == "PAUSED":
+                self._cast_connect_pending = False
+                status_text = "Paused"
+                color = "#2196f3"
+            elif playback_state in ("CONNECTED", "CONNECTED_LAUNCHING"):
+                status_text = "Launching Media…"
+                color = "#64b5f6"
+            else:
+                status_text = "Connecting…"
+                color = "#64b5f6"
+        else:
+            with self._cast_manager._session_lock:
+                reconnecting = getattr(self._cast_manager, "reconnect_count", 0) > 0 and not session.get("connected")
+                
+            if reconnecting:
+                status_text = "Reconnecting…"
+                color = "#ffb74d"
+            elif playback_state == "PLAYING":
+                status_text = "Playing"
+                color = "#4caf50"
+            elif playback_state == "PAUSED":
+                status_text = "Paused"
+                color = "#2196f3"
+            elif playback_state == "BUFFERING":
+                status_text = "Buffering…"
+                color = "#ffb74d"
+            elif playback_state in ("CONNECTED", "IDLE"):
+                status_text = "Connected"
+                color = "#4caf50"
+            else:
+                status_text = "Disconnected"
+                color = "#e84040"
+
+        self._cast_status_label.setText(status_text)
+        self._cast_status_label.setStyleSheet(f"color: {color}; font-size: 12px; font-style: italic;")
+
+        # Update play/pause button state and text
+        self._cast_is_playing = (playback_state == "PLAYING")
+        self._cast_play_btn.setText("⏸" if self._cast_is_playing else "▶")
+        
+        self._cast_play_btn.setEnabled(has_session)
+        self._cast_slider.setEnabled(has_session)
+
+        # Update UI visibility
+        if connected and playback_state != "DISCONNECTED":
+            self._cast_controls_widget.setVisible(True)
+            self._cast_diag_group.setVisible(True)
+            self._cast_btn.setEnabled(False)
+            self._stop_cast_btn.setEnabled(True)
+        else:
+            self._cast_controls_widget.setVisible(False)
+            self._cast_diag_group.setVisible(False)
+            self._cast_btn.setEnabled(True)
+            self._stop_cast_btn.setEnabled(False)
+
+        # Update slider and labels
+        self._cast_duration = duration
+        if self._cast_duration > 0 and not self._cast_slider.isSliderDown():
+            self._cast_slider.blockSignals(True)
+            self._cast_slider.setValue(int((current_time / self._cast_duration) * 1000))
+            self._cast_slider.blockSignals(False)
+
+        def fmt(secs: float) -> str:
+            secs = max(0.0, secs)
+            m, s = divmod(int(secs), 60)
+            h, m = divmod(m, 60)
+            if h: return f"{h}:{m:02d}:{s:02d}"
+            return f"{m:02d}:{s:02d}"
+
+        self._cast_time_label.setText(f"{fmt(current_time)} / {fmt(self._cast_duration)}")
+
+        # Update diagnostics panel
+        self._update_cast_diagnostics_from_session(session)
+
     def _update_cast_diagnostics(self, status=None) -> None:
+        with self._cast_manager._session_lock:
+            session = dict(self._cast_manager.cast_session)
+        self._update_cast_diagnostics_from_session(session)
+
+    def _update_cast_diagnostics_from_session(self, session: dict) -> None:
         if not hasattr(self, "_cast_diag_text"):
             return
             
+        device = session.get("device_name") or "(none)"
+        playback_state = session.get("playback_state") or "DISCONNECTED"
+        stream_url = session.get("stream_url") or "(none)"
+        media_session_id = session.get("media_session_id")
+        current_time = session.get("last_time") or 0.0
+        duration = session.get("duration") or 0.0
+        
+        # Get additional info from CastManager under lock
         with self._cast_manager._session_lock:
-            device = self._cast_manager.cast_device_name or "(none)"
-            session_active = "ACTIVE" if self._cast_manager.active_cast is not None else "INACTIVE"
-            session = self._cast_manager._session
-            stream_url = session.url if session else "(none)"
-            
-        if status:
-            player_state = getattr(status, "player_state", "UNKNOWN")
-            current_time = getattr(status, "current_time", 0.0) or 0.0
-            duration = getattr(status, "duration", 0.0) or 0.0
-            media_title = getattr(status, "title", None) or (session.title if session else None) or "(none)"
-        else:
-            player_state = self._cast_manager._last_player_state or "UNKNOWN"
-            current_time = self._cast_manager._last_known_time or 0.0
-            duration = self._cast_duration
-            media_title = (session.title if session else None) or "(none)"
-            
+            reconnect_count = self._cast_manager.reconnect_count
+            cc = self._cast_manager.active_cast
+            receiver_app = "(none)"
+            playback_rate = 1.0
+            if cc and cc.status:
+                receiver_app = cc.status.display_name or "(unknown)"
+            if cc and cc.media_controller and cc.media_controller.status:
+                playback_rate = cc.media_controller.status.playback_rate
+                if playback_rate is None:
+                    playback_rate = 1.0
+                    
         def fmt(secs: float) -> str:
             secs = max(0.0, secs)
             m, s = divmod(int(secs), 60)
@@ -978,13 +1140,15 @@ class MainWindow(QMainWindow):
             return f"{m:02d}:{s:02d}"
             
         diag_lines = [
-            f"Connected Device: {device}",
-            f"Playback State: {player_state}",
-            f"Media Title: {media_title}",
+            f"Device Name: {device}",
+            f"Stream URL: {stream_url}",
+            f"Media Session ID: {media_session_id or '(none)'}",
+            f"Inferred Playback State: {playback_state}",
             f"Current Time: {fmt(current_time)} ({current_time:.1f}s)",
             f"Duration: {fmt(duration)} ({duration:.1f}s)",
-            f"Stream URL: {stream_url}",
-            f"Cast Session: {session_active}"
+            f"Playback Rate: {playback_rate:.1f}x",
+            f"Receiver App: {receiver_app}",
+            f"Reconnect Count: {reconnect_count}"
         ]
         
         self._cast_diag_text.setPlainText("\n".join(diag_lines))
@@ -994,7 +1158,7 @@ class MainWindow(QMainWindow):
     def _on_cast(self) -> None:
         device_name = self._selected_cast_device_name or ""
         selected_ip = self._selected_cast_device_ip()
-        url = self._lan_url_label.text()
+        url = self.active_stream_url or self._lan_url_label.text()
         self._debug_print(
             f"[CAST] Attempt with device={device_name} "
             f"stream_server={self._stream_server is not None} "
@@ -1042,6 +1206,7 @@ class MainWindow(QMainWindow):
         self._cast_status_label.setStyleSheet("color: #64b5f6; font-size: 12px; font-style: italic;")
         
         self._cast_connect_pending = True
+        self._cast_poll_timer.start() # Start dedicated playback polling timer!
         
         def cast_done(success: bool) -> None:
             self._debug_print(f"[CAST] Finished with success={success}")
@@ -1064,10 +1229,17 @@ class MainWindow(QMainWindow):
             f"[CAST] Calling cast_manager.cast_url device={device_name} "
             f"url={url} content_type={content_type}"
         )
+        file_path = self._current_file.abs_path if self._current_file else ""
+        file_size = self._current_file.size if self._current_file else 0
+        title = self._current_file.name if self._current_file else "TorrentStream"
+        
         self._cast_manager.cast_url(
             device_name,
             url,
             content_type,
+            title=title,
+            file_path=file_path,
+            file_size=file_size,
             on_finished=lambda success: QTimer.singleShot(0, lambda: cast_done(success))
         )
 
@@ -1116,54 +1288,6 @@ class MainWindow(QMainWindow):
     @_ui_debug_handler
     def _on_cast_media_status(self, status) -> None:
         self._debug_print(f"[CAST] Media status callback received: {status}", logging.DEBUG)
-        QTimer.singleShot(0, lambda: self._update_cast_status(status))
-
-    @_ui_debug_handler
-    def _update_cast_status(self, status) -> None:
-        if not status:
-            self._debug_print("[CAST] Ignoring empty media status", logging.WARNING)
-            return
-            
-        player_state = getattr(status, "player_state", "UNKNOWN")
-        has_session = bool(getattr(status, "media_session_id", None))
-        
-        # 2. Fix “Connected Successfully” behavior: Show success ONLY after media session active or player_state exists
-        if self._cast_connect_pending:
-            if player_state in {"PLAYING", "BUFFERING", "PAUSED"} or has_session:
-                self._cast_connect_pending = False
-                device_name = self._selected_cast_device_name or "Chromecast"
-                self._cast_btn.setEnabled(False)
-                self._stop_cast_btn.setEnabled(True)
-                self._cast_controls_widget.setVisible(True)
-                self._cast_diag_group.setVisible(True)
-                self._cast_status_label.setText(f"✅ Connected to {device_name}")
-                self._cast_status_label.setStyleSheet("color: #4caf50; font-size: 12px; font-style: italic;")
-                
-        # 4. Add real playback-state synchronization (Track: PLAYING, PAUSED, BUFFERING, IDLE, UNKNOWN)
-        self._cast_is_playing = (player_state == "PLAYING")
-        self._cast_play_btn.setText("⏸" if self._cast_is_playing else "▶")
-        
-        self._cast_play_btn.setEnabled(has_session)
-        self._cast_slider.setEnabled(has_session)
-        
-        self._cast_duration = status.duration or 0.0
-        current_time = status.current_time or 0.0
-        
-        if self._cast_duration > 0 and not self._cast_slider.isSliderDown():
-            self._cast_slider.blockSignals(True)
-            self._cast_slider.setValue(int((current_time / self._cast_duration) * 1000))
-            self._cast_slider.blockSignals(False)
-            
-        def fmt(secs: float) -> str:
-            secs = max(0.0, secs)
-            m, s = divmod(int(secs), 60)
-            h, m = divmod(m, 60)
-            if h: return f"{h}:{m:02d}:{s:02d}"
-            return f"{m:02d}:{s:02d}"
-            
-        self._cast_time_label.setText(f"{fmt(current_time)} / {fmt(self._cast_duration)}")
-        
-        self._update_cast_diagnostics(status)
 
     @Slot()
     @_ui_debug_handler
@@ -1284,6 +1408,13 @@ class MainWindow(QMainWindow):
     def _on_cancel(self) -> None:
         """Cancel the current torrent session entirely."""
         self._debug_print("[STREAM] Cancel requested")
+
+        # Stop and disconnect cast session if active
+        if self._cast_manager.cast_session.get("connected"):
+            self._debug_print("[STREAM] Stopping Cast session due to torrent cancel")
+            self._on_stop_cast()
+
+        self.active_stream_url = None
 
         # Tear down HTTP streaming layer FIRST
         if self._stream_server is not None:
@@ -1491,6 +1622,8 @@ class MainWindow(QMainWindow):
             port = self._stream_server.port
             self._debug_print(f"[STREAM] Reusing existing HTTP server on port {port}", logging.DEBUG)
 
+        self._lan_ip = get_lan_ip()
+        self.active_stream_url = f"http://{self._lan_ip}:{port}/video"
         self._update_external_urls(port)
         self._stream_panel.setVisible(True)
         self._debug_print(f"[STREAM] Streaming ready via {self._stream_server.url}", logging.DEBUG)
