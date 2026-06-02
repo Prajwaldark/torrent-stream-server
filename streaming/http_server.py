@@ -115,7 +115,7 @@ class _LoopbackThreadingServer(ThreadingHTTPServer):
         import sys
         exc_type, exc_value, _ = sys.exc_info()
         if exc_type and issubclass(exc_type, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
-            log.info("[HTTP] Client disconnected during stream read client=%s", client_address[0])
+            log.debug("[HTTP] Client disconnected during stream read client=%s", client_address[0])
             return
         try:
             super().handle_error(request, client_address)
@@ -132,11 +132,11 @@ class _StreamHandler(BaseHTTPRequestHandler):
             super().handle()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as exc:
             client_ip = self.client_address[0] if self.client_address else "unknown"
-            log.info("[HTTP] Client disconnected during stream read client=%s (%s)", client_ip, str(exc))
+            log.debug("[HTTP] Client disconnected during stream read client=%s (%s)", client_ip, str(exc))
         except OSError as exc:
             client_ip = self.client_address[0] if self.client_address else "unknown"
             if getattr(exc, "winerror", None) == 10054 or exc.errno == 10054 or "10054" in str(exc):
-                log.info("[HTTP] Client disconnected during stream read client=%s (WinError 10054)", client_ip)
+                log.debug("[HTTP] Client disconnected during stream read client=%s (WinError 10054)", client_ip)
             else:
                 log.debug("[HTTP] OSError in request handler client=%s: %s", client_ip, exc)
         except Exception as exc:
@@ -153,7 +153,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
             if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
                 if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
                     raise
-            log.info("[HTTP] Client disconnected during stream read")
+            log.debug("[HTTP] Client disconnected during stream read")
 
     def do_GET(self) -> None:
         server: _LoopbackThreadingServer = self.server  # type: ignore[assignment]
@@ -164,7 +164,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
                     if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
                         raise
-                log.info("[HTTP] Client disconnected during stream read")
+                log.debug("[HTTP] Client disconnected during stream read")
             return
 
         with server.viewers_lock:
@@ -175,7 +175,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
             if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
                 if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
                     raise
-            log.info("[HTTP] Client disconnected during stream read")
+            log.debug("[HTTP] Client disconnected during stream read")
         finally:
             with server.viewers_lock:
                 server.active_viewers = max(0, server.active_viewers - 1)
@@ -280,9 +280,9 @@ class _StreamHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0]
         # Log request diagnostics
         if range_header:
-            log.info("[HTTP] Range request start=%d end=%d client=%s reconnect_count=%d", start, end, client_ip, reconnect_count)
+            log.debug("[HTTP] Range request start=%d end=%d client=%s reconnect_count=%d", start, end, client_ip, reconnect_count)
         else:
-            log.info("[HTTP] Request whole file client=%s reconnect_count=%d", client_ip, reconnect_count)
+            log.debug("[HTTP] Request whole file client=%s reconnect_count=%d", client_ip, reconnect_count)
 
         # ── Seek detection ───────────────────────────────────────────
         with server.state_lock:
@@ -316,7 +316,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
             if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
                 if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
                     raise
-            log.info("[HTTP] Client disconnected during stream read")
+            log.debug("[HTTP] Client disconnected during stream read")
             return
 
         if head_only:
@@ -336,7 +336,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     if isinstance(exc, OSError) and not isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
                         if getattr(exc, "winerror", None) != 10054 and exc.errno != 10054 and "10054" not in str(exc):
                             raise
-                    log.info("[HTTP] Client disconnected during stream read (sent=%d/%d client=%s)", sent, content_length, client_ip)
+                    log.debug("[HTTP] Client disconnected during stream read (sent=%d/%d client=%s)", sent, content_length, client_ip)
                     return
                 sent += len(chunk)
                 with server.state_lock:
@@ -349,7 +349,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
                     if elapsed < expected_time:
                         time.sleep(expected_time - elapsed)
 
-            log.info("[HTTP] Serve completed: start=%d end=%d client=%s sent=%d bytes_served=%d", start, end, client_ip, sent, sent)
+            log.debug("[HTTP] Serve completed: start=%d end=%d client=%s sent=%d bytes_served=%d", start, end, client_ip, sent, sent)
         except Exception as exc:  # noqa: BLE001 — never crash request thread
             log.warning("read_range failed: %s", exc)
 
@@ -424,6 +424,14 @@ class StreamServer:
     @property
     def port(self) -> int:
         return self._port
+
+    @property
+    def bind_host(self) -> str:
+        return self._host
+
+    @property
+    def network_accessible(self) -> bool:
+        return self._host != "127.0.0.1"
 
     @property
     def url(self) -> str:

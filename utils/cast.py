@@ -169,28 +169,33 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
             self._update_devices()
             return
 
-        try:
-            log.info("Starting Chromecast discovery")
-            self._zconf = zeroconf.Zeroconf()
+        import threading
+        
+        def _run_discovery():
+            try:
+                log.info("Starting Chromecast discovery")
+                self._zconf = zeroconf.Zeroconf()
 
-            def add_callback(uuid, service):
-                log.debug("Chromecast service added: uuid=%s service=%s", uuid, service)
-                self._update_devices()
+                def add_callback(uuid, service):
+                    log.debug("Chromecast service added: uuid=%s service=%s", uuid, service)
+                    self._update_devices()
 
-            def remove_callback(uuid, service, cast_info):
-                log.debug("Chromecast service removed: uuid=%s cast=%s", uuid, cast_info)
-                self._update_devices()
+                def remove_callback(uuid, service, cast_info):
+                    log.debug("Chromecast service removed: uuid=%s cast=%s", uuid, cast_info)
+                    self._update_devices()
 
-            def update_callback(uuid, service):
-                log.debug("Chromecast service updated: uuid=%s service=%s", uuid, service)
-                self._update_devices()
+                def update_callback(uuid, service):
+                    log.debug("Chromecast service updated: uuid=%s service=%s", uuid, service)
+                    self._update_devices()
 
-            listener = pychromecast.SimpleCastListener(add_callback, remove_callback, update_callback)
-            self._browser = pychromecast.CastBrowser(listener, self._zconf)
-            self._browser.start_discovery()
-            log.info("Chromecast discovery started")
-        except Exception as exc:
-            log.error("Failed to start Chromecast discovery: %s", exc)
+                listener = pychromecast.SimpleCastListener(add_callback, remove_callback, update_callback)
+                self._browser = pychromecast.CastBrowser(listener, self._zconf)
+                self._browser.start_discovery()
+                log.info("Chromecast discovery started")
+            except Exception as exc:
+                log.error("Failed to start Chromecast discovery: %s", exc)
+                
+        threading.Thread(target=_run_discovery, daemon=True, name="CastDiscoveryThread").start()
 
     def _update_devices(self) -> None:
         if not self._browser:
@@ -343,11 +348,21 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
                 if prev_update > 0 and (now - prev_update) > 0.2:
                     time_progressed = (current_time > prev_time + 0.01)
 
-                # Set base connection details
-                self.cast_connected = False
+                # Set base connection details.
+                # Some Chromecast stacks briefly report socket disconnects
+                # while media status is still updating; don't immediately
+                # collapse the session if a media session is still live.
+                connected = False
                 if self._current_cast:
                     socket_client = getattr(self._current_cast, "socket_client", None)
-                    self.cast_connected = getattr(socket_client, "is_connected", False) if socket_client else False
+                    connected = getattr(socket_client, "is_connected", False) if socket_client else False
+                    if not connected and (
+                        media_session_id
+                        or player_state in {"BUFFERING", "PLAYING", "PAUSED"}
+                        or self.cast_session.get("playback_state") in {"BUFFERING", "PLAYING", "PAUSED"}
+                    ):
+                        connected = True
+                    self.cast_connected = connected
                     if self.cast_connected:
                         self.active_cast = self._current_cast
                         self.active_media_controller = getattr(self._current_cast, "media_controller", None)
@@ -408,7 +423,7 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
 
             # 6. Add logging once: [CAST] Media status updated: player_state, current_time, duration, device_name
             device_name = self.cast_device_name or (session.device_name if session else "(unknown)")
-            log.info(
+            log.debug(
                 "[CAST] Media status updated: state=%s time=%.1f duration=%.1f device=%s",
                 inferred,
                 current_time,
@@ -436,7 +451,7 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
                 return
 
             device_name = session.device_name if session else "(unknown)"
-            log.info(
+            log.debug(
                 "[CAST] Receiver status device=%s app_id=%s app=%s transport_id=%s",
                 device_name,
                 status.app_id,
@@ -450,7 +465,7 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
         try:
             address = status.address.address if status.address else None
             port = status.address.port if status.address else None
-            log.info(
+            log.debug(
                 "[CAST] Connection status=%s address=%s port=%s service=%s",
                 status.status,
                 address,
@@ -463,10 +478,29 @@ class CastManager(MediaStatusListener, CastStatusListener, ConnectionStatusListe
                 CONNECTION_STATUS_FAILED,
                 CONNECTION_STATUS_LOST,
             ):
-                was_active = False
                 with self._session_lock:
-                    if self.active_cast or self._current_cast or self._session:
-                        was_active = True
+                    live_media = False
+                    if self._current_cast and getattr(self._current_cast, "media_controller", None):
+                        mc = self._current_cast.media_controller
+                        mc_status = getattr(mc, "status", None)
+                        live_media = bool(getattr(mc_status, "media_session_id", None))
+                        if not live_media:
+                            live_media = self.cast_session.get("playback_state") in {"BUFFERING", "PLAYING", "PAUSED"}
+
+                    if live_media:
+                        log.warning(
+                            "[CAST] Ignoring transient connection status=%s while media session is still active",
+                            status.status,
+                        )
+                        self.cast_connected = True
+                        self.cast_session["connected"] = True
+                        if self.cast_session.get("playback_state") == "DISCONNECTED":
+                            self.cast_session["playback_state"] = "CONNECTED"
+                        self._start_status_poller()
+                        self._refresh_status_async()
+                        return
+
+                    was_active = bool(self.active_cast or self._current_cast or self._session)
                     self.cast_connected = False
                     self.cast_playing = False
                     self.cast_device_name = None

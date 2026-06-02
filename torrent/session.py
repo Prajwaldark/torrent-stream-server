@@ -69,9 +69,13 @@ class TorrentWorker(QObject):
         self._handle: Optional[lt.torrent_handle] = None
         self._torrent_info: Optional[lt.torrent_info] = None
         self._running = False
+        import queue
+        self._cmd_queue = queue.Queue()
         self._selected_file_index: int = -1
         self._selected_first_piece: int = -1
         self._selected_last_piece: int = -1
+        self._startup_last_piece: int = -1
+        self._startup_target_bytes: int = 0
         self._selection_started_at: float = 0.0
         self._last_piece_finished_at: float = 0.0
         self._pieces_finished_since_selection: int = 0
@@ -87,45 +91,55 @@ class TorrentWorker(QObject):
     @Slot(str)
     def add_magnet(self, uri: str) -> None:
         """Parse and add a magnet link to the session."""
+        self._cmd_queue.put(("add_magnet", uri))
+
+    @Slot(str)
+    def add_torrent_file(self, path: str) -> None:
+        """Load a .torrent file and add it."""
+        self._cmd_queue.put(("add_torrent", path))
+
+    def _get_save_path(self) -> str:
+        if self._config.save_path:
+            # Ensure path exists
+            from pathlib import Path
+            Path(self._config.save_path).mkdir(parents=True, exist_ok=True)
+            return self._config.save_path
+        return str(self._config.cache_dir)
+
+    def _do_add_magnet(self, uri: str) -> None:
         log.info("Adding magnet: %s", uri[:80])
         self._reset_scheduler_diagnostics()
         self._ensure_session()
         params = lt.parse_magnet_uri(uri)
-        params.save_path = str(self._config.cache_dir)
+        params.save_path = self._get_save_path()
         params.flags |= lt.torrent_flags.sequential_download
         self._handle = self._session.add_torrent(params)
         self._handle.set_sequential_download(True)
         log.info("Torrent added — waiting for metadata…")
 
-    @Slot(str)
-    def add_torrent_file(self, path: str) -> None:
-        """Load a .torrent file and add it."""
+    def _do_add_torrent_file(self, path: str) -> None:
         log.info("Adding torrent file: %s", path)
         self._reset_scheduler_diagnostics()
         self._ensure_session()
         info = lt.torrent_info(path)
         params = lt.add_torrent_params()
         params.ti = info
-        params.save_path = str(self._config.cache_dir)
+        params.save_path = self._get_save_path()
         params.flags |= lt.torrent_flags.sequential_download
         self._handle = self._session.add_torrent(params)
         self._handle.set_sequential_download(True)
 
         # .torrent files already have metadata
         self._torrent_info = info
-        files = detect_video_files(info, str(self._config.cache_dir))
+        files = detect_video_files(info, self._get_save_path())
         self.metadata_ready.emit(files)
 
     @Slot(int)
     def select_file(self, file_index: int) -> None:
-        """
-        Focus the torrent on a single file.
+        """Focus the torrent on a single file."""
+        self._cmd_queue.put(("select_file", file_index))
 
-        Sets file-level priorities (selected file = 7, all others = 0)
-        and enables sequential download. Per-piece priorities — the
-        actual streaming window — are managed by ``SeekPrioritizer``,
-        which is attached separately from the UI thread.
-        """
+    def _do_select_file(self, file_index: int) -> None:
         if self._handle is None or self._torrent_info is None:
             return
         self._selected_file_index = file_index
@@ -150,6 +164,15 @@ class TorrentWorker(QObject):
             last_byte // piece_length,
             self._torrent_info.num_pieces() - 1,
         )
+        self._startup_target_bytes = min(self._config.startup_buffer_bytes, file_size)
+        if self._startup_target_bytes > 0:
+            startup_last_byte = file_offset + self._startup_target_bytes - 1
+            self._startup_last_piece = min(
+                startup_last_byte // piece_length,
+                self._selected_last_piece,
+            )
+        else:
+            self._startup_last_piece = self._selected_first_piece - 1
         sequential = False
         try:
             sequential = bool(self._handle.status().sequential_download)
@@ -174,7 +197,50 @@ class TorrentWorker(QObject):
             file_prios[file_index],
             all(priority == 0 for idx, priority in enumerate(file_prios) if idx != file_index),
         )
+        log.info(
+            "[SCHED] Startup window: target=%.1fMB pieces=%d-%d piece_size=%.1fMB",
+            self._startup_target_bytes / (1024 * 1024),
+            self._selected_first_piece,
+            self._startup_last_piece,
+            piece_length / (1024 * 1024),
+        )
         self._log_scheduler_state("after select_file", force_full=True)
+
+    @Slot()
+    def pause_download(self) -> None:
+        self._cmd_queue.put(("pause",))
+
+    def _do_pause_download(self) -> None:
+        if self._handle:
+            self._handle.pause()
+            log.info("Torrent paused")
+
+    @Slot()
+    def resume_download(self) -> None:
+        self._cmd_queue.put(("resume",))
+
+    def _do_resume_download(self) -> None:
+        if self._handle:
+            self._handle.resume()
+            log.info("Torrent resumed")
+
+    @Slot()
+    def remove_torrent(self) -> None:
+        self._cmd_queue.put(("remove",))
+
+    def _do_remove_torrent(self) -> None:
+        if self._session and self._handle:
+            try:
+                self._session.remove_torrent(self._handle)
+                log.info("Torrent removed from session")
+            except Exception:
+                pass
+        self._handle = None
+        self._torrent_info = None
+        self._selected_file_index = -1
+        self._selected_first_piece = -1
+        self._selected_last_piece = -1
+        self._reset_scheduler_diagnostics()
 
     def get_handle(self):
         return self._handle
@@ -228,11 +294,38 @@ class TorrentWorker(QObject):
         self._running = True
         log.info("Torrent worker started")
 
+        last_stat_emit = 0.0
+
+        import queue
         while self._running:
+            # Process command queue
+            try:
+                while not self._cmd_queue.empty():
+                    cmd = self._cmd_queue.get_nowait()
+                    if cmd[0] == "add_magnet":
+                        self._do_add_magnet(cmd[1])
+                    elif cmd[0] == "add_torrent":
+                        self._do_add_torrent_file(cmd[1])
+                    elif cmd[0] == "select_file":
+                        self._do_select_file(cmd[1])
+                    elif cmd[0] == "pause":
+                        self._do_pause_download()
+                    elif cmd[0] == "resume":
+                        self._do_resume_download()
+                    elif cmd[0] == "remove":
+                        self._do_remove_torrent()
+            except queue.Empty:
+                pass
+
             if self._session:
                 self._process_alerts()
-                self._emit_stats()
-            time.sleep(0.2)  # 200 ms tick
+                
+                now = time.time()
+                if now - last_stat_emit >= 0.5:
+                    self._emit_stats()
+                    last_stat_emit = now
+                    
+            time.sleep(0.1)  # 100 ms tick
 
         log.info("Torrent worker stopped")
 
@@ -260,6 +353,8 @@ class TorrentWorker(QObject):
             "enable_upnp": True,
             "enable_natpmp": True,
         }
+        if self._config.connections_limit > 0:
+            settings["connections_limit"] = self._config.connections_limit
         if self._config.max_download_rate > 0:
             settings["download_rate_limit"] = self._config.max_download_rate
         if self._config.max_upload_rate > 0:
@@ -298,7 +393,7 @@ class TorrentWorker(QObject):
             return
         log.info("Metadata received: %s", self._torrent_info.name())
         files = detect_video_files(
-            self._torrent_info, str(self._config.cache_dir)
+            self._torrent_info, self._get_save_path()
         )
         self.metadata_ready.emit(files)
 
@@ -320,6 +415,8 @@ class TorrentWorker(QObject):
         self._selected_file_index = -1
         self._selected_first_piece = -1
         self._selected_last_piece = -1
+        self._startup_last_piece = -1
+        self._startup_target_bytes = 0
         self._selection_started_at = 0.0
         self._last_piece_finished_at = 0.0
         self._pieces_finished_since_selection = 0
@@ -339,8 +436,8 @@ class TorrentWorker(QObject):
         if (
             self._selection_started_at > 0
             and self._pieces_finished_since_selection == 0
-            and now - self._selection_started_at >= 15.0
-            and now - self._last_stall_dump_at >= 15.0
+            and now - self._selection_started_at >= 8.0
+            and now - self._last_stall_dump_at >= 8.0
         ):
             self._last_stall_dump_at = now
             log.warning("[SCHED] No pieces completed within %.1fs after file selection", now - self._selection_started_at)
@@ -359,9 +456,11 @@ class TorrentWorker(QObject):
         piece_zero_state = self._piece_state_summary(0, queue_summary["piece_states"])
         head_piece = self._selected_first_piece if self._selected_first_piece >= 0 else 0
         startup_piece_state = self._piece_state_summary(head_piece, queue_summary["piece_states"])
+        elapsed = max(0.001, time.monotonic() - self._selection_started_at) if self._selection_started_at > 0 else 0.0
+        pieces_per_sec = self._pieces_finished_since_selection / elapsed if elapsed > 0 else 0.0
 
         log.debug(
-            "[SCHED] %s: rate=%dB/s peers=%d active_requests=%d downloading_pieces=%d queued_pieces=%d sequential=%s total_wanted_done=%d",
+            "[SCHED] %s: rate=%dB/s peers=%d active_requests=%d downloading_pieces=%d queued_pieces=%d sequential=%s total_wanted_done=%d startup_rate=%.2fpcs/s startup_completed=%d",
             reason,
             int(status.download_rate),
             int(status.num_peers),
@@ -370,9 +469,19 @@ class TorrentWorker(QObject):
             queue_summary["queued_pieces"],
             bool(status.sequential_download),
             int(getattr(status, "total_wanted_done", 0)),
+            pieces_per_sec,
+            self._pieces_finished_since_selection,
         )
         log.debug("[SCHED] piece 0: %s", piece_zero_state)
         log.debug("[SCHED] startup piece %d: %s", head_piece, startup_piece_state)
+        if self._selected_first_piece >= 0 and self._startup_last_piece >= self._selected_first_piece:
+            log.debug(
+                "[SCHED] startup window status: pieces=%d-%d completed=%d/%d",
+                self._selected_first_piece,
+                self._startup_last_piece,
+                self._count_completed_startup_pieces(),
+                self._startup_last_piece - self._selected_first_piece + 1,
+            )
 
         if force_full and self._selected_first_piece >= 0 and self._selected_last_piece >= self._selected_first_piece:
             self._log_priority_readback(head_piece)
@@ -531,3 +640,15 @@ class TorrentWorker(QObject):
             return bool(int(value))
         except Exception:
             return False
+
+    def _count_completed_startup_pieces(self) -> int:
+        if self._handle is None or self._selected_first_piece < 0 or self._startup_last_piece < self._selected_first_piece:
+            return 0
+        completed = 0
+        for piece in range(self._selected_first_piece, self._startup_last_piece + 1):
+            try:
+                if self._handle.have_piece(piece):
+                    completed += 1
+            except Exception:
+                continue
+        return completed

@@ -43,7 +43,7 @@ class _ColorFormatter(logging.Formatter):
 DEBUG_MODE = False
 
 
-def setup_logging(level: int = logging.DEBUG) -> None:
+def setup_logging(level: int = logging.INFO) -> None:
     """Configure root logger with file + coloured console handlers."""
     root = logging.getLogger()
     if root.handlers:

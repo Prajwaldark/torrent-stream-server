@@ -31,12 +31,18 @@ def _config_path() -> Path:
 @dataclass
 class AppConfig:
     # Buffering
-    buffer_mb: int = 32
-    """Minimum megabytes to buffer before playback starts."""
+    startup_buffer_mb: int = 24
+    """Fixed startup buffer target used before playback begins."""
+
+    buffer_mb: int = 96
+    """Preferred rolling playback buffer after startup."""
 
     # Download
     cache_dir: str = field(default_factory=_default_cache_dir)
     """Temporary directory used for in-progress downloads."""
+    
+    save_path: str = ""
+    """Permanent save directory. If empty, cache_dir is used (streaming mode)."""
 
     sequential: bool = True
     """Force sequential piece download order."""
@@ -80,3 +86,7 @@ class AppConfig:
     @property
     def buffer_bytes(self) -> int:
         return self.buffer_mb * 1024 * 1024
+
+    @property
+    def startup_buffer_bytes(self) -> int:
+        return self.startup_buffer_mb * 1024 * 1024

@@ -32,13 +32,13 @@ def _check_imports() -> bool:
         try:
             importlib.import_module(module)
         except ImportError:
-            errors.append(f"  ✗  {module} — {hint}")
+            errors.append(f"  [X]  {module} - {hint}")
 
     if errors:
         print("Missing dependencies:\n" + "\n".join(errors))
         return False
 
-    print("✓  All imports OK")
+    print("[OK] All imports OK")
     return True
 
 
@@ -65,28 +65,71 @@ def main() -> int:
     log = logging.getLogger(__name__)
     log.info("Starting Torrent Streaming Player…")
 
+    import time
+    t0 = time.time()
     from utils.config import AppConfig
     from cache.cleanup import CacheManager
 
     config = AppConfig.load()
     cache = CacheManager(config.cache_dir)
+    
+    t1 = time.time()
+    log.info("[STARTUP] Cache & Config init: %.3fs", t1 - t0)
+    
+    log.warning(
+        "Performance Tip: If you experience lag, add exclusions in Windows Defender "
+        "for the project folder (%%CD%%) and cache folder (%s) to prevent real-time "
+        "disk scanning overhead during torrent downloads.",
+        config.cache_dir
+    )
 
     # Qt requires QApplication before any widget
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt
 
+    t2 = time.time()
     app = QApplication(sys.argv)
     app.setApplicationName("TorrentStream")
     app.setOrganizationName("TorrentStream")
+    t3 = time.time()
+    log.info("[STARTUP] Qt Application init: %.3fs", t3 - t2)
 
     # Windows: enable ANSI escape codes for coloured console output
     if sys.platform == "win32":
         import os
         os.system("")   # one-liner that enables VT100 in cmd.exe / PowerShell
 
+    t4 = time.time()
     from ui.main_window import MainWindow
     window = MainWindow(config, cache)
+    t5 = time.time()
+    log.info("[STARTUP] Main Window creation: %.3fs", t5 - t4)
+    
     window.show()
+    t6 = time.time()
+    log.info("[STARTUP] Window show: %.3fs", t6 - t5)
+    log.info("[STARTUP] Total startup time: %.3fs", t6 - t0)
+
+    # Background performance diagnostics
+    import threading
+    import psutil
+    import time
+    
+    def run_diagnostics():
+        process = psutil.Process(os.getpid())
+        while True:
+            try:
+                cpu_percent = process.cpu_percent(interval=1.0)
+                memory_info = process.memory_info()
+                mb = memory_info.rss / (1024 * 1024)
+                # Count active threads
+                thread_count = threading.active_count()
+                log.info("[PERF] CPU: %.1f%% | Memory: %.1f MB | Threads: %d", cpu_percent, mb, thread_count)
+            except Exception as e:
+                log.debug("[PERF] Diagnostics error: %s", e)
+            time.sleep(10)
+            
+    threading.Thread(target=run_diagnostics, daemon=True, name="DiagnosticsThread").start()
 
     log.info("Event loop started")
     return app.exec()

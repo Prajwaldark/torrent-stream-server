@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import Iterator, Optional
 
 log = logging.getLogger("STREAM")
@@ -136,6 +137,12 @@ class StreamSource:
         if not self.is_attached() or self._piece_size <= 0 or self._file_size <= 0:
             return []
 
+        import time
+        now = time.time()
+        # Cache the heavy piece scan for 1 second to prevent UI freezes
+        if getattr(self, "_last_ranges_time", 0) + 1.0 > now:
+            return getattr(self, "_last_ranges", [])
+
         handle = self._handle
         first_piece = self._first_piece
         last_piece = self._last_piece
@@ -145,25 +152,53 @@ class StreamSource:
 
         ranges: list[tuple[int, int]] = []
         start_piece: Optional[int] = None
+        
+        # libtorrent has a status().pieces attribute which is a bitfield
+        # we can use that instead of calling have_piece thousands of times
+        try:
+            status = handle.status()
+            pieces = status.pieces
+        except Exception:
+            pieces = None
+            
         for piece_idx in range(first_piece, last_piece + 1):
             try:
-                have_piece = bool(handle.have_piece(piece_idx))
+                if pieces is not None:
+                    have_piece = pieces[piece_idx]
+                else:
+                    have_piece = bool(handle.have_piece(piece_idx))
             except Exception:
                 have_piece = False
+
             if have_piece:
                 if start_piece is None:
                     start_piece = piece_idx
-                continue
-            if start_piece is not None:
-                ranges.append(
-                    self._piece_range_to_bytes(start_piece, piece_idx - 1, piece_size, file_offset, file_size)
-                )
-                start_piece = None
+            else:
+                if start_piece is not None:
+                    ranges.append(
+                        self._piece_range_to_bytes(
+                            start_piece,
+                            piece_idx - 1,
+                            piece_size,
+                            file_offset,
+                            file_size,
+                        )
+                    )
+                    start_piece = None
 
         if start_piece is not None:
             ranges.append(
-                self._piece_range_to_bytes(start_piece, last_piece, piece_size, file_offset, file_size)
+                self._piece_range_to_bytes(
+                    start_piece,
+                    last_piece,
+                    piece_size,
+                    file_offset,
+                    file_size,
+                )
             )
+
+        self._last_ranges = ranges
+        self._last_ranges_time = now
         return ranges
 
     def have_byte(self, byte_in_file: int) -> bool:
@@ -287,11 +322,14 @@ class StreamSource:
                 is_tail = (piece_idx >= self._last_piece - TAIL_PIECE_COUNT + 1)
                 wait_timeout = TAIL_WAIT_TIMEOUT if is_tail else timeout
                 if not self._wait_for_piece(piece_idx, timeout=wait_timeout):
-                    log.info(
-                        "Piece %d not available within %.0fs — closing stream",
+                    if not self.is_attached():
+                        return
+                    log.warning(
+                        "Piece %d not available within %.0fs — stalling stream and retrying",
                         piece_idx, wait_timeout,
                     )
-                    return
+                    time.sleep(0.25)
+                    continue
                 if not self.is_attached():
                     return
 
@@ -323,9 +361,11 @@ class StreamSource:
                         log.debug("read() failed at %d: %s", read_offset, exc)
                         return
                     if not data:
-                        # libtorrent hasn't flushed yet — wait briefly and
-                        # let the next iteration re-check have_piece
-                        if not self._wait_for_piece(piece_idx, timeout=5.0):
+                        # libtorrent has the piece but the file backing it
+                        # has not flushed yet. Keep the connection open and
+                        # retry instead of terminating the stream.
+                        time.sleep(0.1)
+                        if not self.is_attached():
                             return
                         try:
                             fh.seek(read_offset)

@@ -13,7 +13,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, List, Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot, QVariantAnimation
 from PySide6.QtGui import QImage, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -74,9 +74,62 @@ class _DebugEmitter(QObject):
     message = Signal(str)
 
 
+class _AnimatedCastButton(QPushButton):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._hover_val = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(200)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.valueChanged.connect(self._on_anim)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_style()
+
+    def enterEvent(self, event) -> None:
+        if self.isEnabled():
+            self._anim.setDirection(QVariantAnimation.Direction.Forward)
+            self._anim.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._anim.setDirection(QVariantAnimation.Direction.Backward)
+        self._anim.start()
+        super().leaveEvent(event)
+
+    def _on_anim(self, val: float) -> None:
+        self._hover_val = val
+        self._update_style()
+
+    def _update_style(self) -> None:
+        r = int(30 + (50 - 30) * self._hover_val)
+        g = int(77 + (130 - 77) * self._hover_val)
+        b = int(140 + (220 - 140) * self._hover_val)
+        
+        br_r = int(30 + (80 - 30) * self._hover_val)
+        br_g = int(77 + (160 - 77) * self._hover_val)
+        br_b = int(140 + (255 - 140) * self._hover_val)
+        
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: rgb({r}, {g}, {b});
+                color: #fff;
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 6px 16px;
+                border: 1px solid rgb({br_r}, {br_g}, {br_b});
+            }}
+            QPushButton:disabled {{
+                background: #2a2a2a;
+                color: #777;
+                border: 1px solid #333;
+            }}
+        """)
+
+
 class _DebugLogHandler(logging.Handler):
     def __init__(self, emitter: _DebugEmitter) -> None:
-        super().__init__(level=logging.DEBUG)
+        super().__init__(level=logging.INFO)
         self._emitter = emitter
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -173,6 +226,8 @@ class MainWindow(QMainWindow):
     cast_devices_changed = Signal(list)
 
     def __init__(self, config: AppConfig, cache: CacheManager) -> None:
+        import time
+        t0 = time.time()
         super().__init__()
         self._config = config
         self._cache = cache
@@ -180,17 +235,24 @@ class MainWindow(QMainWindow):
         self._files: List[FileInfo] = []
         self._is_active = False  # True when a torrent session is running
         self._stream_ready = False
+        self._torrent_complete = False
         self._debug_backlog: List[str] = []
+        self._last_buffer_state_signature: Optional[tuple[int, int, int, tuple[int, ...], bool]] = None
         self._debug_emitter = _DebugEmitter()
         self._debug_emitter.message.connect(self._append_debug_message)
         self._ui_log_handler: Optional[_DebugLogHandler] = None
+        
+        t1 = time.time()
         self._lan_ip = get_lan_ip()
+        t2 = time.time()
+        log.info("[STARTUP] Network probing: %.3fs", t2 - t1)
+        
         self._cast_devices: dict[str, object] = {}
         self._selected_cast_device_name: Optional[str] = None
         self._selected_cast_device: Optional[object] = None
 
         # Sub-components
-        self._buffer_monitor = BufferMonitor(config.buffer_bytes)
+        self._buffer_monitor = BufferMonitor(config.startup_buffer_bytes)
         self._prioritizer = SeekPrioritizer()
 
         # HTTP streaming layer
@@ -198,20 +260,26 @@ class MainWindow(QMainWindow):
         self._stream_source = StreamSource()
         self._stream_server: Optional[StreamServer] = None
 
+        t3 = time.time()
         # Torrent worker in its own thread
         self._torrent_thread = QThread(self)
         self._torrent_worker = TorrentWorker(config)
         self._torrent_worker.moveToThread(self._torrent_thread)
         self._torrent_thread.started.connect(self._torrent_worker.run)
+        t4 = time.time()
+        log.info("[STARTUP] Torrent worker init: %.3fs", t4 - t3)
 
         # Buffer polling timer
         self._buffer_timer = QTimer(self)
         self._buffer_timer.setInterval(500)
         self._buffer_timer.timeout.connect(self._poll_buffer)
 
+        t5 = time.time()
         # Cast Manager
         self._cast_manager = CastManager()
         self.cast_devices_changed.connect(self._update_cast_devices)
+        t6 = time.time()
+        log.info("[STARTUP] Cast manager init: %.3fs", t6 - t5)
 
         self._cast_is_playing = False
         self._cast_duration = 0.0
@@ -224,7 +292,11 @@ class MainWindow(QMainWindow):
         self._cast_poll_timer.setInterval(1000)
         self._cast_poll_timer.timeout.connect(self._poll_cast_playback)
 
+        t7 = time.time()
         self._build_ui()
+        t8 = time.time()
+        log.info("[STARTUP] Build UI widgets: %.3fs", t8 - t7)
+        
         self._attach_debug_log_handler()
         self._flush_debug_backlog()
         self._connect_signals()
@@ -235,13 +307,32 @@ class MainWindow(QMainWindow):
         self.resize(700, 650)
         
         # Start device discovery
+        t9 = time.time()
         self._cast_manager.start_discovery(self._on_cast_devices_changed)
+        t10 = time.time()
+        log.info("[STARTUP] Start cast discovery: %.3fs", t10 - t9)
+        
         self._cast_manager.set_status_listener(self._on_cast_media_status)
         self._cast_manager.set_connection_listener(self._on_cast_connection_changed)
 
         log.info("LAN IP: %s", self._lan_ip)
         log.info("HTTP bind address: %s", self._stream_bind_address())
         self._sync_stream_debug_state()
+        
+        self._debug_shortcut = QShortcut(QKeySequence("Ctrl+Shift+J"), self)
+        self._debug_shortcut.activated.connect(self._toggle_debug_console)
+        
+        log.info("[STARTUP] Total MainWindow init: %.3fs", time.time() - t0)
+
+    @Slot()
+    def _toggle_debug_console(self) -> None:
+        is_visible = not self._debug_group.isVisible()
+        self._debug_group.setVisible(is_visible)
+        self._diag_group.setVisible(is_visible)
+        # Resize window to fit or shrink if needed, but letting layout handle it is usually fine
+        # If we hide it, we might want to shrink the window back.
+        if not is_visible:
+            self.adjustSize()
 
     def _attach_debug_log_handler(self) -> None:
         if self._ui_log_handler is not None:
@@ -269,7 +360,7 @@ class MainWindow(QMainWindow):
         for message in backlog:
             self._append_debug_message(message)
 
-    def _debug_print(self, message: str, level: int = logging.INFO) -> None:
+    def _debug_print(self, message: str, level: int = logging.DEBUG) -> None:
         if self._ui_log_handler is None:
             self._append_debug_message(message)
         log.log(level, message)
@@ -303,7 +394,16 @@ class MainWindow(QMainWindow):
         button.clicked.connect(wrapped)
 
     def _stream_bind_address(self) -> str:
+        if self._stream_server is not None:
+            return self._stream_server.bind_host
         return "0.0.0.0" if self._config.bind_all_interfaces else "127.0.0.1"
+
+    def _preferred_stream_lan_ip(self, target_host: Optional[str] = None) -> str:
+        try:
+            return get_lan_ip(target_host=target_host)
+        except TypeError:
+            # Backward-compatible fallback if the helper signature changes.
+            return get_lan_ip()
 
     def _reset_cast_combo_rendering(self) -> None:
         pass
@@ -406,6 +506,9 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(20, 20, 20, 20)
         content_layout.setSpacing(20)
 
+        # ── Save Location Panel ──────────────────────────────────────
+        content_layout.addWidget(self._build_save_panel())
+
         # ── Stats panel ──────────────────────────────────────────────
         content_layout.addWidget(self._build_stats_panel())
 
@@ -430,10 +533,9 @@ class MainWindow(QMainWindow):
         self._refresh_cast_btn.setStyleSheet("background: #252525; color: #ddd; border: 1px solid #444; border-radius: 6px; padding: 6px 12px;")
         cast_device_row.addWidget(self._refresh_cast_btn)
 
-        self._cast_btn = QPushButton("Connect")
+        self._cast_btn = _AnimatedCastButton("Connect")
         self._connect_button(self._cast_btn, "Cast", self._on_cast)
         self._cast_btn.setEnabled(False)
-        self._cast_btn.setStyleSheet("background: #1e4d8c; color: #fff; font-weight: bold; border-radius: 6px; padding: 6px 16px;")
         cast_device_row.addWidget(self._cast_btn)
 
         self._stop_cast_btn = QPushButton("Disconnect")
@@ -607,21 +709,23 @@ class MainWindow(QMainWindow):
         self._stream_panel.setVisible(False)
         content_layout.addWidget(self._stream_panel)
 
-        diag_group = QGroupBox("Startup Diagnostics")
-        diag_layout = QVBoxLayout(diag_group)
+        self._diag_group = QGroupBox("Startup Diagnostics")
+        diag_layout = QVBoxLayout(self._diag_group)
         self._startup_diag_text = QPlainTextEdit()
         self._startup_diag_text.setReadOnly(True)
         self._startup_diag_text.setMaximumHeight(120)
         diag_layout.addWidget(self._startup_diag_text)
-        content_layout.addWidget(diag_group)
+        self._diag_group.setVisible(False)
+        content_layout.addWidget(self._diag_group)
 
-        debug_group = QGroupBox("Debug Console")
-        debug_layout = QVBoxLayout(debug_group)
+        self._debug_group = QGroupBox("Debug Console")
+        debug_layout = QVBoxLayout(self._debug_group)
         self._debug_console = QPlainTextEdit()
         self._debug_console.setReadOnly(True)
         self._debug_console.setMinimumHeight(180)
         debug_layout.addWidget(self._debug_console)
-        content_layout.addWidget(debug_group)
+        self._debug_group.setVisible(False)
+        content_layout.addWidget(self._debug_group)
 
         content_layout.addStretch(1)
 
@@ -684,6 +788,124 @@ class MainWindow(QMainWindow):
         h.addWidget(self._cancel_btn)
 
         return bar
+
+    def _build_save_panel(self) -> QWidget:
+        panel = QWidget()
+        h = QHBoxLayout(panel)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(10)
+
+        self._save_path_label = QLineEdit()
+        self._save_path_label.setReadOnly(True)
+        self._save_path_label.setStyleSheet("color: #aaa; background: #222; border: 1px solid #444; border-radius: 4px; padding: 4px;")
+        
+        if self._config.save_path:
+            self._save_path_label.setText(f"Save To: {self._config.save_path}")
+        else:
+            self._save_path_label.setText("Save To: (Temporary Streaming Cache)")
+
+        self._change_save_btn = QPushButton("Change Folder…")
+        self._change_save_btn.setFixedHeight(28)
+        self._connect_button(self._change_save_btn, "Change Save Path", self._on_change_save_path)
+
+        self._reset_save_btn = QPushButton("Reset")
+        self._reset_save_btn.setFixedHeight(28)
+        self._reset_save_btn.setToolTip("Reset to Temporary Streaming Cache")
+        self._connect_button(self._reset_save_btn, "Reset Save Path", self._on_reset_save_path)
+
+        self._save_file_btn = QPushButton("Save Downloaded File…")
+        self._save_file_btn.setFixedHeight(28)
+        self._save_file_btn.setEnabled(False)
+        self._save_file_btn.setToolTip("Copy the completed file to a permanent location")
+        self._connect_button(self._save_file_btn, "Save Downloaded File", self._on_save_downloaded_file)
+
+        h.addWidget(self._save_path_label, stretch=1)
+        h.addWidget(self._change_save_btn)
+        h.addWidget(self._reset_save_btn)
+        h.addWidget(self._save_file_btn)
+        
+        return panel
+
+    @Slot()
+    @_ui_debug_handler
+    def _on_reset_save_path(self) -> None:
+        self._config.save_path = ""
+        self._config.save()
+        self._save_path_label.setText("Save To: (Temporary Streaming Cache)")
+        self._debug_print("Save path reset to temporary cache")
+
+    @Slot()
+    @_ui_debug_handler
+    def _on_change_save_path(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        import os
+        
+        current_dir = self._config.save_path or os.path.expanduser("~")
+        new_dir = QFileDialog.getExistingDirectory(
+            self, "Select Download Directory", current_dir,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks
+        )
+        
+        if new_dir:
+            self._config.save_path = new_dir
+            self._config.save()
+            self._save_path_label.setText(f"Save To: {new_dir}")
+            self._debug_print(f"Permanent save path set to: {new_dir}")
+        elif new_dir == "":
+            # If user clears or cancels, we might want to keep the old one, but 
+            # wait, if they want to clear it, they can't via QFileDialog easily.
+            # Let's add a clear button next time or right-click. For now, just cancel.
+            pass
+
+    def _update_save_file_button(self) -> None:
+        source_path = Path(self._current_file.abs_path) if self._current_file else None
+        enabled = bool(
+            self._current_file is not None
+            and self._torrent_complete
+            and source_path is not None
+            and source_path.exists()
+            and source_path.is_file()
+        )
+        self._save_file_btn.setEnabled(enabled)
+
+    @Slot()
+    @_ui_debug_handler
+    def _on_save_downloaded_file(self) -> None:
+        if self._current_file is None:
+            self._set_status("⚠️  No downloaded file is selected yet.")
+            return
+        if not self._torrent_complete:
+            self._set_status("⚠️  Wait for the selected file to finish downloading before saving it.")
+            return
+
+        source = Path(self._current_file.abs_path)
+        if not source.exists() or not source.is_file():
+            self._set_status("⚠️  Downloaded file is not available on disk yet.")
+            return
+
+        default_dir = self._config.save_path or str(Path.home())
+        default_target = str(Path(default_dir) / self._current_file.name)
+        target_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Downloaded File",
+            default_target,
+            "Video Files (*.mp4 *.mkv *.avi *.webm *.mov *.m4v *.ts *.flv);;All Files (*)",
+        )
+        if not target_path:
+            return
+
+        target = Path(target_path)
+        if source.resolve() == target.resolve():
+            self._set_status("ℹ️  The downloaded file is already at that location.")
+            return
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        import shutil
+
+        shutil.copy2(source, target)
+        self._set_status(f"💾  Saved downloaded file to {target}")
+        self._debug_print(f"[SAVE] Copied downloaded file from {source} to {target}")
 
     def _build_stats_panel(self) -> QWidget:
         panel = QWidget()
@@ -779,6 +1001,8 @@ class MainWindow(QMainWindow):
         self._debug_print("[UI] Connecting signal 'piece_finished' -> _on_piece_finished")
         self._torrent_worker.piece_finished.connect(self._on_piece_finished)
         self._torrent_worker.piece_finished.connect(self._piece_waiter.piece_done)
+        self._debug_print("[UI] Connecting signal 'torrent_finished' -> _on_torrent_finished")
+        self._torrent_worker.torrent_finished.connect(self._on_torrent_finished)
         self._debug_print("[UI] Connecting signal 'error_occurred' -> _on_torrent_error")
         self._torrent_worker.error_occurred.connect(self._on_torrent_error)
         self._debug_print("[UI] Connecting signal 'device_combo.currentTextChanged' -> _on_cast_device_selected")
@@ -801,9 +1025,9 @@ class MainWindow(QMainWindow):
         self._pause_dl_btn.setEnabled(active)
         self._cancel_btn.setEnabled(active)
 
-    def _update_external_urls(self, port: int) -> None:
+    def _update_external_urls(self, port: int, target_host: Optional[str] = None) -> None:
         localhost_url = f"http://127.0.0.1:{port}/video"
-        self._lan_ip = get_lan_ip()
+        self._lan_ip = self._preferred_stream_lan_ip(target_host=target_host)
         lan_url = f"http://{self._lan_ip}:{port}/video"
         self._debug_print(f"[STREAM] Generated localhost URL: {localhost_url}")
         self._debug_print(f"[STREAM] Generated LAN URL: {lan_url}")
@@ -1188,11 +1412,26 @@ class MainWindow(QMainWindow):
             return
 
         self._debug_print(f"[CAST] Stream URL for cast: {url}")
-        
+
+        if self._stream_server is not None:
+            port = self._stream_server.port
+            routed_lan_ip = self._preferred_stream_lan_ip(
+                selected_ip if selected_ip != "(none)" else None
+            )
+            url = f"http://{routed_lan_ip}:{port}/video"
+            self.active_stream_url = url
+            self._update_external_urls(
+                port,
+                target_host=selected_ip if selected_ip != "(none)" else None,
+            )
+            self._debug_print(
+                f"[CAST] Recomputed cast URL using route-aware LAN IP: {url}"
+            )
+
         content_type = "video/mp4"
         if self._current_file:
             from streaming.http_server import guess_content_type
-            content_type = guess_content_type(self._current_file.name)
+            content_type = guess_content_type(self._current_file.abs_path)
         elif url.startswith("http"):
             from streaming.http_server import guess_content_type
             content_type = guess_content_type(url)
@@ -1360,6 +1599,7 @@ class MainWindow(QMainWindow):
         # Reset state
         self._current_file = None
         self._stream_ready = False
+        self._torrent_complete = False
         self._buffer_bar.setValue(0)
         self._buffer_timer.stop()
         self._stream_panel.setVisible(False)
@@ -1370,7 +1610,9 @@ class MainWindow(QMainWindow):
         self._sync_stream_debug_state()
 
         # Update buffer monitor
-        self._buffer_monitor = BufferMonitor(self._config.buffer_bytes)
+        self._buffer_monitor = BufferMonitor(self._config.startup_buffer_bytes)
+        self._last_buffer_state_signature = None
+        self._update_save_file_button()
 
         # Make sure cache is clean for new session
         self._cache.ensure_fresh()
@@ -1438,6 +1680,8 @@ class MainWindow(QMainWindow):
         self._current_file = None
         self._files = []
         self._stream_ready = False
+        self._torrent_complete = False
+        self._last_buffer_state_signature = None
         self._buffer_bar.setValue(0)
         self._name_label.setText("No torrent loaded")
         self._speed_label.setText("↓ 0 B/s")
@@ -1451,6 +1695,7 @@ class MainWindow(QMainWindow):
         self._lan_url_label.setText("Waiting for stream...")
         self._qr_label.clear()
         self._qr_label.setText("QR Code\n(Pending)")
+        self._update_save_file_button()
         self._sync_stream_debug_state()
 
 
@@ -1492,6 +1737,15 @@ class MainWindow(QMainWindow):
         # Nothing to do here — buffer_monitor uses the handle directly
         self._debug_print(f"[STREAM] Piece finished: {index}", logging.DEBUG)
 
+    @Slot()
+    @_ui_debug_handler
+    def _on_torrent_finished(self) -> None:
+        self._torrent_complete = True
+        self._update_save_file_button()
+        if self._current_file is not None:
+            self._set_status("✅  Download complete — file can now be saved.")
+        self._debug_print("[STREAM] Torrent finished downloading")
+
     @Slot(str)
     @_ui_debug_handler
     def _on_torrent_error(self, message: str) -> None:
@@ -1514,8 +1768,13 @@ class MainWindow(QMainWindow):
     @_ui_debug_handler
     def _select_file(self, file: FileInfo) -> None:
         self._current_file = file
+        self._torrent_complete = False
+        self._last_buffer_state_signature = None
+        self._update_save_file_button()
         self._name_label.setText(f"📄 {file.name}  ({file.human_size()})")
-        self._set_status(f"⏳  Buffering — waiting for {self._config.buffer_mb} MB…")
+        self._set_status(
+            f"⏳  Buffering — waiting for {self._config.startup_buffer_mb} MB startup buffer…"
+        )
 
         handle = self._torrent_worker.get_handle()
         info = self._torrent_worker.get_torrent_info()
@@ -1546,7 +1805,17 @@ class MainWindow(QMainWindow):
             # Apply the streaming window immediately so the initial
             # buffer fills with pieces from the FRONT of the file,
             # not whatever libtorrent finds easiest.
-            self._prioritizer.on_seek_bytes(0)
+            self._prioritizer.enter_startup_phase(0)
+            startup_state = self._buffer_monitor.startup_buffer_state()
+            if startup_state:
+                self._debug_print(
+                    f"[BUFFER] startup target={self._config.startup_buffer_mb}MB "
+                    f"required={startup_state['required_first_piece']}-{startup_state['required_last_piece']} "
+                    f"contiguous={startup_state['contiguous_first_piece'] if startup_state['contiguous_first_piece'] is not None else '-'}-"
+                    f"{startup_state['contiguous_last_piece'] if startup_state['contiguous_last_piece'] is not None else '-'} "
+                    f"missing={startup_state['missing_pieces']} ready={startup_state['ready']}",
+                    logging.DEBUG,
+                )
             self._buffer_timer.start()
             self._debug_print(f"[STREAM] Started buffering file: {file.abs_path}")
         else:
@@ -1565,22 +1834,47 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            state = self._buffer_monitor.startup_buffer_state()
             pct = self._buffer_monitor.buffer_percent()
             self._buffer_bar.setValue(int(pct))
             buf_downloaded = self._buffer_monitor.buffer_bytes_downloaded()
+            ready = bool(state and state["ready"])
 
             log.debug(
                 "Buffer poll: %.1f%%  (%s / %s)  ready=%s",
                 pct,
                 _fmt_size(buf_downloaded),
-                _fmt_size(self._config.buffer_bytes),
-                self._buffer_monitor.is_ready(),
+                _fmt_size(self._config.startup_buffer_bytes),
+                ready,
             )
 
-            if self._buffer_monitor.is_ready() and not self._stream_ready:
+            if state:
+                signature = (
+                    int(state["required_first_piece"]),
+                    int(state["required_last_piece"]),
+                    int(state["contiguous_last_piece"]) if state["contiguous_last_piece"] is not None else -1,
+                    tuple(int(p) for p in state["missing_pieces"]),
+                    bool(state["ready"]),
+                )
+                if signature != self._last_buffer_state_signature:
+                    self._last_buffer_state_signature = signature
+                    self._debug_print(
+                        f"[BUFFER] startup_target={self._config.startup_buffer_mb}MB "
+                        f"required_pieces={state['required_first_piece']}-{state['required_last_piece']} "
+                        f"contiguous={state['contiguous_first_piece'] if state['contiguous_first_piece'] is not None else '-'}-"
+                        f"{state['contiguous_last_piece'] if state['contiguous_last_piece'] is not None else '-'} "
+                        f"missing={state['missing_pieces']} contiguous_bytes={state['contiguous_bytes']} "
+                        f"target_bytes={state['target_bytes']} ready={state['ready']}",
+                        logging.DEBUG,
+                    )
+
+            if ready and not self._stream_ready:
                 self._start_streaming()
             elif not self._stream_ready:
-                self._set_status(f"Startup Buffer: {pct:.0f}%")
+                self._set_status(
+                    f"Startup Buffer: {pct:.0f}% ({_fmt_size(buf_downloaded)} / "
+                    f"{_fmt_size(self._config.startup_buffer_bytes)})"
+                )
             else:
                 self._set_status("▶  Server Ready — Stream URL is active")
 
@@ -1594,7 +1888,7 @@ class MainWindow(QMainWindow):
                 ranges = self._stream_source.buffered_ranges()
                 if ranges:
                     # Calculate total megabytes buffered
-                    buffered_bytes = sum(end - start for start, end in ranges)
+                    buffered_bytes = sum(end - start + 1 for start, end in ranges)
                     buffered_mb = buffered_bytes / (1024 * 1024)
                     self._buffered_ahead_label.setText(f"Buffered Ahead: {buffered_mb:.1f} MB")
                 else:
@@ -1607,22 +1901,36 @@ class MainWindow(QMainWindow):
     def _start_streaming(self) -> None:
         if self._current_file is None or self._stream_ready:
             return
-        self._stream_ready = True
-        self._buffer_bar.setValue(100)
-        self._set_status("▶  Server Ready — Stream URL is active")
-
-        # Keep the buffer timer running to continue showing stats
-
-        # Spin up the localhost HTTP server
+        state = self._buffer_monitor.startup_buffer_state()
+        if not state or not state["ready"]:
+            self._debug_print(
+                "[STREAM] Startup buffer not contiguous yet; delaying server start",
+                logging.WARNING,
+            )
+            return
+        # Spin up the HTTP server. LAN and Cast streaming require a server
+        # bound beyond loopback, so force a LAN bind even if an older config
+        # file still has bind_all_interfaces disabled.
         if self._stream_server is None:
-            self._stream_server = StreamServer(self._stream_source, bind_all=self._config.bind_all_interfaces)
+            if not self._config.bind_all_interfaces:
+                self._debug_print(
+                    "[STREAM] bind_all_interfaces is disabled in config; forcing LAN bind for network streaming and cast",
+                    logging.WARNING,
+                )
+            self._stream_server = StreamServer(self._stream_source, bind_all=True)
             _, port, url = self._stream_server.start()
             self._debug_print(f"[STREAM] HTTP server started at {url}", logging.DEBUG)
         else:
             port = self._stream_server.port
             self._debug_print(f"[STREAM] Reusing existing HTTP server on port {port}", logging.DEBUG)
 
-        self._lan_ip = get_lan_ip()
+        self._stream_ready = True
+        self._prioritizer.enter_playback_phase(0)
+        self._buffer_bar.setValue(100)
+        self._set_status("▶  Server Ready — Stream URL is active")
+
+        # Keep the buffer timer running to continue showing stats
+        self._lan_ip = self._preferred_stream_lan_ip()
         self.active_stream_url = f"http://{self._lan_ip}:{port}/video"
         self._update_external_urls(port)
         self._stream_panel.setVisible(True)
