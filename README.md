@@ -26,7 +26,16 @@ Built with **Python 3.12+**, **PySide6** (Qt6), and **libtorrent**.
 
 ## Quick Start (Windows)
 
-### Option A — Automated setup (Recommended)
+### Option 1 — Pre-built Executable (Easiest)
+
+If you don't want to install Python, you can use the pre-built executable.
+
+1. Navigate to `dist\Torrent Stream Player\`
+2. Double-click `Torrent Stream Player.exe` to run the app directly!
+
+*(Note: Ensure all files inside the `dist\Torrent Stream Player` folder remain together, especially the `_internal` directory.)*
+
+### Option 2 — Automated setup (From Source)
 
 Just run the setup script to automatically create a virtual environment, upgrade pip, and install all dependencies:
 
@@ -40,7 +49,7 @@ Run the application:
 .\.venv\Scripts\python main.py
 ```
 
-### Option B — Manual Installation
+### Option 3 — Manual Installation (From Source)
 
 ```bash
 # 1. Create virtual environment
