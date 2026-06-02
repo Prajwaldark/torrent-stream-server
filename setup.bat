@@ -20,9 +20,7 @@ python -m pip install --upgrade pip
 REM 3. Install Python dependencies
 echo.
 echo [3/4] Installing Python packages...
-pip install PySide6
-pip install libtorrent
-pip install python-mpv
+pip install -r requirements.txt
 
 REM If libtorrent fails, try the alternate package name:
 REM   pip install python-libtorrent
