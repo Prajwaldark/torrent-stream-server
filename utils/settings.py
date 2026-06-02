@@ -1,0 +1,100 @@
+"""
+utils/settings.py — Application configuration.
+
+Stores all tuneable parameters. Loaded from / saved to a JSON file
+so settings survive between sessions.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+
+def _default_cache_dir() -> str:
+    import tempfile
+    return str(Path(tempfile.gettempdir()) / "torrent_stream_cache")
+
+
+def _config_path() -> Path:
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    else:
+        base = Path.home() / ".config"
+    cfg_dir = base / "TorrentStreamPlayer"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    return cfg_dir / "settings.json"
+
+
+@dataclass
+class SettingsManager:
+    config_version: int = 1
+
+    # Buffering
+    startup_buffer_mb: int = 16
+    """Fixed startup buffer target used before playback begins."""
+
+    buffer_mb: int = 96
+    """Preferred rolling playback buffer after startup."""
+
+    # Download
+    cache_dir: str = field(default_factory=_default_cache_dir)
+    """Temporary directory used for in-progress downloads."""
+
+    sequential: bool = True
+    """Force sequential piece download order."""
+
+    keep_on_exit: bool = False
+    """If True, downloaded files are kept after the app closes."""
+
+    bind_all_interfaces: bool = True
+    """If True, HTTP server binds to 0.0.0.0 for LAN streaming."""
+
+    # UI Preferences
+    bitrate_limit: str = "Unlimited"
+    preferred_player: str = "vlc"
+    preferred_cast_device: str = ""
+    last_save_dir: str = ""
+    last_open_dir: str = ""
+    window_geometry: str = ""
+    window_state: str = ""
+
+    # Torrent session tuning
+    max_upload_rate: int = 0       # 0 = unlimited
+    max_download_rate: int = 0     # 0 = unlimited
+    connections_limit: int = 200
+
+    # ------------------------------------------------------------------ #
+    #  Persistence                                                         #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def load(cls) -> "SettingsManager":
+        path = _config_path()
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                # Only keep keys that exist in the dataclass to avoid errors
+                # when old config files have stale keys.
+                valid_keys = {f for f in cls.__dataclass_fields__}
+                filtered = {k: v for k, v in data.items() if k in valid_keys}
+                return cls(**filtered)
+            except Exception:
+                pass
+        return cls()
+
+    def save(self) -> None:
+        path = _config_path()
+        path.write_text(
+            json.dumps(asdict(self), indent=2), encoding="utf-8"
+        )
+
+    @property
+    def buffer_bytes(self) -> int:
+        return self.buffer_mb * 1024 * 1024
+
+    @property
+    def startup_buffer_bytes(self) -> int:
+        return self.startup_buffer_mb * 1024 * 1024

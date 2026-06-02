@@ -88,7 +88,7 @@ class BufferMonitor:
         if self._handle is None or self._target == 0 or self._startup_last_piece < self._startup_first_piece:
             return False
         state = self.startup_buffer_state()
-        ready = bool(state and not state["missing_pieces"])
+        ready = bool(state and state["ready"])
         self._maybe_log_state(state)
         return ready
 
@@ -146,6 +146,10 @@ class BufferMonitor:
             if not self._have_piece(piece_idx):
                 missing_pieces.append(piece_idx)
 
+        # Relaxed startup validation: accept 4MB contiguous to start playback quickly
+        relaxed_target = min(4 * 1024 * 1024, self._target)
+        is_ready = bool(contiguous_bytes >= relaxed_target or not missing_pieces)
+
         state = {
             "required_first_piece": self._startup_first_piece,
             "required_last_piece": self._startup_last_piece,
@@ -154,7 +158,7 @@ class BufferMonitor:
             "contiguous_bytes": contiguous_bytes,
             "target_bytes": self._target,
             "missing_pieces": missing_pieces,
-            "ready": not missing_pieces,
+            "ready": is_ready,
         }
         self._last_state = state
         self._last_state_time = now

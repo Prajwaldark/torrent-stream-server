@@ -67,10 +67,10 @@ def main() -> int:
 
     import time
     t0 = time.time()
-    from utils.config import AppConfig
+    from utils.settings import SettingsManager
     from cache.cleanup import CacheManager
 
-    config = AppConfig.load()
+    config = SettingsManager.load()
     cache = CacheManager(config.cache_dir)
     
     t1 = time.time()

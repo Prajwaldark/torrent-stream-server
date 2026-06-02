@@ -10,7 +10,7 @@ from torrent.prioritizer import (
     PRIO_SKIP,
     SeekPrioritizer,
 )
-from utils.config import AppConfig
+from utils.settings import SettingsManager
 
 
 MB = 1024 * 1024
@@ -66,7 +66,7 @@ class _FakeHandle:
 
 class StartupSchedulingTests(unittest.TestCase):
     def test_startup_buffer_is_fixed_and_independent_from_playback_buffer(self):
-        cfg = AppConfig(buffer_mb=125)
+        cfg = SettingsManager(buffer_mb=125)
 
         self.assertEqual(cfg.startup_buffer_mb, 24)
         self.assertEqual(cfg.startup_buffer_bytes, 24 * MB)

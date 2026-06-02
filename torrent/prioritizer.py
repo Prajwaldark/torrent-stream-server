@@ -37,12 +37,12 @@ PHASE_PLAYBACK = "playback"
 
 # Startup phase: aggressively focus the first few pieces so playback can
 # begin quickly, even on torrents with very large pieces.
-STARTUP_CRITICAL_WINDOW_BYTES = 24 * 1024 * 1024
-STARTUP_PREFETCH_WINDOW_BYTES = 16 * 1024 * 1024
-STARTUP_MID_WINDOW_BYTES = 32 * 1024 * 1024
+STARTUP_CRITICAL_WINDOW_BYTES = 16 * 1024 * 1024
+STARTUP_PREFETCH_WINDOW_BYTES = 0
+STARTUP_MID_WINDOW_BYTES = 0
 STARTUP_TAIL_PIECES = 2
-STARTUP_TAIL_PRIORITY = PRIO_PREFETCH
-STARTUP_DEADLINE_STEP_MS = 150
+STARTUP_TAIL_PRIORITY = PRIO_CRITICAL
+STARTUP_DEADLINE_STEP_MS = 50
 
 # Playback phase: broaden the queue once streaming has started so the
 # reader has more runway and the swarm can maintain throughput.
@@ -386,6 +386,13 @@ class SeekPrioritizer:
                     self._handle.piece_priority(p, new_prio)
                     if new_prio == PRIO_CRITICAL:
                         self._arm_deadline(p)
+                    elif old_prio == PRIO_CRITICAL:
+                        clear_fn = getattr(self._handle, "reset_piece_deadline", None)
+                        if clear_fn:
+                            try:
+                                clear_fn(p)
+                            except Exception:
+                                pass
                     changed += 1
                 except Exception as exc:
                     log.debug("piece_priority(%d, %d) failed: %s",
